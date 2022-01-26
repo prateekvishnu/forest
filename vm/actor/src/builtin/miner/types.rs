@@ -8,7 +8,8 @@ use cid::Cid;
 use clock::ChainEpoch;
 use encoding::{serde_bytes, tuple::*, BytesDe};
 use fil_types::{
-    PoStProof, Randomness, RegisteredPoStProof, RegisteredSealProof, SectorNumber, StoragePower,
+    PoStProof, Randomness, RegisteredPoStProof, RegisteredSealProof,
+    RegisteredUpdateProof, SectorNumber, StoragePower,
 };
 use num_bigint::bigint_ser;
 use vm::{DealID, TokenAmount};
@@ -324,4 +325,20 @@ pub struct ProveCommitAggregateParams {
     pub sector_numbers: UnvalidatedBitField,
     #[serde(with = "serde_bytes")]
     pub aggregate_proof: Vec<u8>,
+}
+
+#[derive(Debug, PartialEq, Clone, Serialize_tuple, Deserialize_tuple)]
+pub struct ReplicaUpdate {
+    pub sector_number: SectorNumber,
+    pub deadline: usize,
+    pub partition: usize,
+    pub new_sealed_sector_cid: Cid,
+    pub deals : Vec<DealID>,
+    pub update_proof_type: RegisteredUpdateProof,
+    pub replica_proof: Vec<u8>,
+}
+
+#[derive(Debug, Serialize_tuple, Deserialize_tuple)]
+pub struct ProveReplicaUpdatesParams {
+    pub updates: Vec<ReplicaUpdate>,
 }

@@ -235,6 +235,10 @@ pub trait Syscalls {
         &self,
         aggregate: &fil_types::AggregateSealVerifyProofAndInfos,
     ) -> Result<(), Box<dyn StdError>>;
+    fn verify_replica_update(
+        &self,
+        replica_info: &fil_types::ReplicaUpdateInfo,
+    ) -> Result<(), Box<dyn StdError>>;
 }
 
 /// Result of checking two headers for a consensus fault.

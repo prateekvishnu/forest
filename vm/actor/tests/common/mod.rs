@@ -806,4 +806,11 @@ impl Syscalls for MockRuntime {
         // TODO: Implement this if we need it. Currently don't have a need.
         todo!()
     }
+    fn verify_replica_update(
+        &self,
+        _replica_info: &fil_types::ReplicaUpdateInfo,
+    ) -> Result<(), Box<dyn StdError>> {
+        // TODO: Implement this if we need it. Currently don't have a need.
+        todo!()
+    }
 }

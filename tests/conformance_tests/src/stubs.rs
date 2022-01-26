@@ -79,4 +79,10 @@ impl Syscalls for TestSyscalls {
     ) -> Result<(), Box<dyn StdError>> {
         Ok(())
     }
+    fn verify_replica_update(
+        &self,
+        replica_info: &fil_types::ReplicaUpdateInfo,
+    ) -> Result<(), Box<dyn StdError>> {
+        Ok(())
+    }
 }

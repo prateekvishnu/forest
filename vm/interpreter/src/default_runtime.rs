@@ -1128,6 +1128,13 @@ where
             .charge_gas(self.price_list.on_verify_aggregate_seals(aggregate))?;
         V::verify_aggregate_seals(aggregate)
     }
+
+    fn verify_replica_update(
+        &self,
+        replica_info: &fil_types::ReplicaUpdateInfo,
+    ) -> Result<(), Box<dyn StdError>> {
+        todo!()
+    }
 }
 
 /// Transfers funds from one Actor to another Actor

@@ -231,12 +231,39 @@ impl RegisteredSealProof {
             )),
         }
     }
+
+    // TODO: doc comment
+    pub fn registered_update_proof(self) -> Result<RegisteredUpdateProof, String> {
+        use RegisteredUpdateProof::*;
+        match self {
+            Self::StackedDRG64GiBV1 | Self::StackedDRG64GiBV1P1 => Ok(StackedDRG64GiBV1),
+            Self::StackedDRG32GiBV1 | Self::StackedDRG32GiBV1P1 => Ok(StackedDRG32GiBV1),
+            Self::StackedDRG2KiBV1 | Self::StackedDRG2KiBV1P1 => Ok(StackedDRG2KiBV1),
+            Self::StackedDRG8MiBV1 | Self::StackedDRG8MiBV1P1 => Ok(StackedDRG8MiBV1),
+            Self::StackedDRG512MiBV1 | Self::StackedDRG512MiBV1P1 => Ok(StackedDRG512MiBV1),
+            Self::Invalid(_) => Err(format!(
+                "Unsupported mapping from {:?} to Update RegisteredProof",
+                self
+            )),
+        }
+    }
 }
 
 /// Seal proof type which defines the version and sector size.
 #[derive(PartialEq, Eq, Copy, Clone, Debug, Hash)]
 pub enum RegisteredAggregateProof {
     SnarkPackV1,
+    Invalid(i64),
+}
+
+/// Proof of update type
+#[derive(PartialEq, Eq, Copy, Clone, Debug, Hash)]
+pub enum RegisteredUpdateProof {
+    StackedDRG2KiBV1,
+    StackedDRG8MiBV1,
+    StackedDRG512MiBV1,
+    StackedDRG32GiBV1,
+    StackedDRG64GiBV1,
     Invalid(i64),
 }
 
@@ -293,6 +320,15 @@ i64_conversion! {
 i64_conversion! {
     RegisteredAggregateProof;
     SnarkPackV1 => 0,
+}
+
+i64_conversion! {
+    RegisteredUpdateProof;
+    StackedDRG2KiBV1 => 0,
+    StackedDRG8MiBV1 => 1,
+    StackedDRG512MiBV1 => 2,
+    StackedDRG32GiBV1 => 3,
+    StackedDRG64GiBV1 => 4,
 }
 #[cfg(feature = "proofs")]
 impl TryFrom<RegisteredAggregateProof> for filecoin_proofs_api::RegisteredAggregationProof {
@@ -396,6 +432,25 @@ impl Serialize for RegisteredAggregateProof {
 }
 
 impl<'de> Deserialize<'de> for RegisteredAggregateProof {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let val = i64::deserialize(deserializer)?;
+        Ok(Self::from(val))
+    }
+}
+
+impl Serialize for RegisteredUpdateProof {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        i64::from(*self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RegisteredUpdateProof {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,

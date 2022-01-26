@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0, MIT
 
 use crate::{
-    ActorID, Randomness, RegisteredAggregateProof, RegisteredSealProof, SectorID, SectorNumber,
+    ActorID, Randomness, RegisteredAggregateProof, RegisteredSealProof,
+    RegisteredUpdateProof, SectorID, SectorNumber,
 };
 use cid::Cid;
 use clock::ChainEpoch;
@@ -64,4 +65,14 @@ pub struct AggregateSealVerifyProofAndInfos {
     #[serde(with = "serde_bytes")]
     pub proof: Vec<u8>,
     pub infos: Vec<AggregateSealVerifyInfo>,
+}
+
+/// Information needed to verify a replica update
+#[derive(Clone, Debug, PartialEq, Serialize_tuple, Deserialize_tuple)]
+pub struct ReplicaUpdateInfo {
+    pub update_proof_type: RegisteredUpdateProof,
+    pub old_sealed_sector_cid: Cid,
+    pub new_sealed_sector_cid: Cid,
+    pub new_unsealed_sector_cid: Cid,
+    pub proof: Vec<u8>,
 }

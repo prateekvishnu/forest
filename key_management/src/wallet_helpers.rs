@@ -71,8 +71,9 @@ pub fn generate(sig_type: SignatureType) -> Result<Vec<u8>, Error> {
     let rng = &mut OsRng::default();
     match sig_type {
         SignatureType::BLS => {
-            let key = BlsPrivate::generate(rng);
-            Ok(key.as_bytes())
+            // let key = BlsPrivate::generate(rng);
+            // Ok(key.as_bytes())
+            unimplemented!()
         }
         SignatureType::Secp256k1 => {
             let key = SecpPrivate::random(rng);
