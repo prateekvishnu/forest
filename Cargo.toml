@@ -71,4 +71,4 @@ forest_runtime = { path = "./vm/runtime" }
 forest_message = { path = "./vm/message" }
 
 [profile.dev]
-debug = 0
+#debug = 0
