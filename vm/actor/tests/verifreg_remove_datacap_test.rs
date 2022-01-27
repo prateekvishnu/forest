@@ -14,6 +14,7 @@ use forest_actor::{
 };
 use std::convert::TryInto;
 use vm::{ExitCode, Serialized};
+use runtime::Runtime;
 
 #[test]
 fn test_remove_datacap() {
@@ -31,6 +32,9 @@ fn test_remove_datacap() {
     let [verifier1, verifier2, verified_client] = create_accounts(&mut rt);
     let verifier_allowance = StoragePower::from(2 * (32u64 << 30));
 
+    rt.in_call = true;
+    dbg!(rt.resolve_address(&verifier1));
+    rt.in_call = false;
     add_verifier(&mut rt, verifier1, verifier_allowance);
     // addVerifierParams := verifreg.AddVerifierParams{
     // 	Address:   verifier1,
@@ -72,6 +76,7 @@ fn create_accounts<const N: usize>(rt: &mut MockRuntime) -> [Address; N] {
         let addr = Address::new_bls(&[seed + i; address::BLS_PUB_LEN]).unwrap();
         let id_addr = state_data.map_address_to_new_id(&rt.store, &addr).unwrap();
         rt.actor_code_cids.insert(id_addr, *ACCOUNT_ACTOR_CODE_ID);
+        rt.id_addresses.insert(addr, id_addr);
         // rt.expect_validate_caller_addr(vec![*SYSTEM_ACTOR_ADDR]);
         // // let x: forest_actor::init::State;
         // // x.map_address_to_new_id(&rt.store, todo!());
