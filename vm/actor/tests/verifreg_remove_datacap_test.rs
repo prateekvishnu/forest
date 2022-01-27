@@ -32,22 +32,26 @@ fn test_remove_datacap() {
     let [verifier1, verifier2, verified_client] = create_accounts(&mut rt);
     let verifier_allowance = StoragePower::from(2 * (32u64 << 30));
 
-    rt.in_call = true;
-    dbg!(rt.resolve_address(&verifier1));
-    rt.in_call = false;
-    add_verifier(&mut rt, verifier1, verifier_allowance);
-    // addVerifierParams := verifreg.AddVerifierParams{
-    // 	Address:   verifier1,
-    // 	Allowance: verifierAllowance,
-    // }
-    // vm.ApplyOk(t, v, vm.VerifregRoot, builtin.VerifiedRegistryActorAddr, big.Zero(), builtin.MethodsVerifiedRegistry.AddVerifier, &addVerifierParams)
+    add_verifier(&mut rt, verifier1, verifier_allowance.clone());
+    add_verifier(&mut rt, verifier2, verifier_allowance);
+
 }
 
 fn add_verifier(rt: &mut MockRuntime, verifier: Address, allowance: StoragePower) {
+    rt.state = None;
+    rt.expect_validate_caller_addr(vec![*SYSTEM_ACTOR_ADDR]);
+    rt.call(
+        &*VERIFREG_ACTOR_CODE_ID,
+        verifreg::Method::Constructor as vm::MethodNum,
+        &Serialized::serialize(*SYSTEM_ACTOR_ADDR).unwrap(),
+    )
+    .unwrap();
     let params = VerifierParams {
         address: verifier,
         allowance,
     };
+
+    rt.expect_validate_caller_addr(vec![*SYSTEM_ACTOR_ADDR]);
     rt.call(
         &*VERIFREG_ACTOR_CODE_ID,
         verifreg::Method::AddVerifier as vm::MethodNum,
