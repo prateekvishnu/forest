@@ -33,8 +33,9 @@ fn test_remove_datacap() {
     let verifier_allowance = StoragePower::from(2 * (32u64 << 30));
 
     add_verifier(&mut rt, verifier1, verifier_allowance.clone());
-    add_verifier(&mut rt, verifier2, verifier_allowance);
+    add_verifier(&mut rt, verifier2, verifier_allowance.clone());
 
+    add_verified_client(&mut rt, verified_client, verifier_allowance.clone());
 }
 
 fn add_verifier(rt: &mut MockRuntime, verifier: Address, allowance: StoragePower) {
@@ -46,15 +47,41 @@ fn add_verifier(rt: &mut MockRuntime, verifier: Address, allowance: StoragePower
         &Serialized::serialize(*SYSTEM_ACTOR_ADDR).unwrap(),
     )
     .unwrap();
+
     let params = VerifierParams {
         address: verifier,
+        allowance,
+    };
+
+    rt.expect_validate_caller_any();
+    rt.expect_validate_caller_addr(vec![*SYSTEM_ACTOR_ADDR]);
+    rt.call(
+        &*VERIFREG_ACTOR_CODE_ID,
+        verifreg::Method::AddVerifier as vm::MethodNum,
+        &Serialized::serialize(params).unwrap(),
+    )
+    .unwrap();
+}
+
+fn add_verified_client(rt: &mut MockRuntime, client: Address, allowance: StoragePower) {
+    rt.state = None;
+    rt.expect_validate_caller_addr(vec![*SYSTEM_ACTOR_ADDR]);
+    rt.call(
+        &*VERIFREG_ACTOR_CODE_ID,
+        verifreg::Method::Constructor as vm::MethodNum,
+        &Serialized::serialize(*SYSTEM_ACTOR_ADDR).unwrap(),
+    )
+    .unwrap();
+    
+    let params = VerifierParams {
+        address: client,
         allowance,
     };
 
     rt.expect_validate_caller_addr(vec![*SYSTEM_ACTOR_ADDR]);
     rt.call(
         &*VERIFREG_ACTOR_CODE_ID,
-        verifreg::Method::AddVerifier as vm::MethodNum,
+        verifreg::Method::AddVerifiedClient as vm::MethodNum,
         &Serialized::serialize(params).unwrap(),
     )
     .unwrap();
