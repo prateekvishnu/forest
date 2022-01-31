@@ -240,13 +240,23 @@ where
                 if processed.contains(&cid) {
                     return Ok(());
                 }
-                println!("{} {} {} {}", msg.from(), msg.to(), msg.sequence(), msg.method_num());
                 
                 let ret = self.apply_message(msg)?;
 
                 if let Some(cb) = &mut callback {
                     cb(&cid, msg, &ret)?;
                 }
+
+                println!("{} {} {} {} {} {} {:?} {}", 
+                    cid, 
+                    msg.from(), 
+                    msg.to(), 
+                    msg.sequence(), 
+                    msg.method_num(), 
+                    ret.msg_receipt.exit_code as u64,
+                    ret.msg_receipt.return_data.bytes(),
+                    ret.msg_receipt.gas_used,
+                );
 
                 // Update totals
                 gas_reward += &ret.miner_tip;
