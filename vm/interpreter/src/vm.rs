@@ -240,6 +240,8 @@ where
                 if processed.contains(&cid) {
                     return Ok(());
                 }
+                println!("{} {} {} {}", msg.from(), msg.to(), msg.sequence(), msg.method_num());
+                
                 let ret = self.apply_message(msg)?;
 
                 if let Some(cb) = &mut callback {
@@ -304,6 +306,7 @@ where
                 callback(&rew_msg.cid()?, &ChainMessage::Unsigned(rew_msg), &ret)?;
             }
         }
+        println!("<<<");
 
         if let Err(e) = self.run_cron(epoch, callback.as_mut()) {
             log::error!("End of epoch cron failed to run: {}", e);

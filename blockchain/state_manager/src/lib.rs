@@ -327,6 +327,9 @@ where
         let receipts =
             vm.apply_block_messages(messages, parent_epoch, epoch, buf_store.clone(), callback)?;
 
+        for r in receipts.iter() {
+            println!("{} {} {}", r.exit_code as u64, r.return_data.bytes(), r.gas_used);
+        }
         // Construct receipt root from receipts
         let rect_root = Amt::new_from_iter(self.blockstore(), receipts)?;
         // Flush changes to blockstore
