@@ -4,6 +4,7 @@
 mod auth_cmd;
 mod chain_cmd;
 mod config;
+mod config_cmd;
 mod fetch_params_cmd;
 mod genesis_cmd;
 mod mpool_cmd;
@@ -38,6 +39,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use structopt::StructOpt;
 
+use crate::cli::config_cmd::ConfigCommands;
 use blocks::tipset_json::TipsetJson;
 use cid::Cid;
 use utils::{read_file_to_string, read_toml};
@@ -90,6 +92,9 @@ pub enum Subcommand {
 
     #[structopt(name = "state", about = "Interact with and query filecoin chain state")]
     State(StateCommands),
+
+    #[structopt(name = "config", about = "Manage node configuration")]
+    Config(ConfigCommands),
 }
 
 /// CLI options
