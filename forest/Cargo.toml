@@ -66,6 +66,11 @@ version = "0.10"
 features = ["easy-errors", "macros", "bytes-v05"]
 default-features = false
 
+[dev-dependencies]
+assert_cmd = "2"
+rand = "0.8"
+tempfile = "3"
+
 [features]
 default = ["rocksdb", "networks/mainnet"]
 rocksdb = ["db/rocksdb", "ipld_blockstore/rocksdb"]

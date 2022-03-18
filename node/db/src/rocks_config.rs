@@ -3,7 +3,7 @@
 use anyhow::anyhow;
 use num_cpus;
 use rocksdb::{DBCompactionStyle, DBCompressionType};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// RocksDB configuration exposed in Forest.
 /// Only subset of possible options is implemented, add missing ones when needed.
