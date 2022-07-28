@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0, MIT
 
 use crate::bad_block_cache::BadBlockCache;
+use crate::consensus::Consensus;
 use crate::metrics;
 use crate::network_context::SyncNetworkContext;
 use crate::sync_state::SyncState;
@@ -10,17 +11,18 @@ use crate::tipset_syncer::{
 };
 use crate::validation::{TipsetValidationError, TipsetValidator};
 
-use beacon::{Beacon, BeaconSchedule};
-use blocks::{Block, Error as ForestBlockError, FullTipset, GossipBlock, Tipset, TipsetKeys};
 use chain::{ChainStore, Error as ChainStoreError};
 use cid::Cid;
-use fil_types::verifier::ProofVerifier;
+use forest_blocks::{
+    Block, Error as ForestBlockError, FullTipset, GossipBlock, Tipset, TipsetKeys,
+};
 use forest_libp2p::{
     hello::HelloRequest, rpc::RequestResponseError, NetworkEvent, NetworkMessage, PubsubMessage,
 };
+use forest_message::SignedMessage;
+use fvm_shared::message::Message;
 use ipld_blockstore::BlockStore;
 use libp2p::core::PeerId;
-use message::{SignedMessage, UnsignedMessage};
 use message_pool::{MessagePool, Provider};
 use state_manager::StateManager;
 
@@ -36,18 +38,18 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use std::sync::Arc;
-use std::{marker::PhantomData, time::SystemTime};
+use std::time::SystemTime;
 
 pub(crate) type WorkerState = Arc<RwLock<SyncState>>;
 
 type ChainMuxerFuture<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send>>;
 
 #[derive(Debug, Error)]
-pub enum ChainMuxerError {
+pub enum ChainMuxerError<C: Consensus> {
     #[error("Tipset processor error: {0}")]
-    TipsetProcessor(#[from] TipsetProcessorError),
+    TipsetProcessor(#[from] TipsetProcessorError<C>),
     #[error("Tipset range syncer error: {0}")]
-    TipsetRangeSyncer(#[from] TipsetRangeSyncerError),
+    TipsetRangeSyncer(#[from] TipsetRangeSyncerError<C>),
     #[error("Tipset validation error: {0}")]
     TipsetValidator(#[from] TipsetValidationError),
     #[error("Sending tipset on channel failed: {0}")]
@@ -66,8 +68,8 @@ pub enum ChainMuxerError {
     NetworkFollowingFailure(String),
 }
 
-/// Struct that defines syncing configuration options
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+/// Structure that defines syncing configuration options
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct SyncConfig {
     /// Request window length for tipsets during chain exchange
     pub req_window: i64,
@@ -109,7 +111,7 @@ enum NetworkHeadEvaluation {
     InSync,
 }
 
-/// Repesents whether received messages should be added to message pool
+/// Represents whether received messages should be added to message pool
 enum PubsubMessageProcessingStrategy {
     /// Messages should be added to the message pool
     Process,
@@ -117,35 +119,32 @@ enum PubsubMessageProcessingStrategy {
     DoNotProcess,
 }
 
-/// The ChainMuxer handles events from the p2p network and orchestrates the chain synchronization.
-pub struct ChainMuxer<DB, TBeacon, V, M> {
-    /// State of the ChainSyncer Future implementation
-    state: ChainMuxerState,
+/// The `ChainMuxer` handles events from the P2P network and orchestrates the chain synchronization.
+pub struct ChainMuxer<DB, M, C: Consensus> {
+    /// State of the `ChainSyncer` `Future` implementation
+    state: ChainMuxerState<C>,
 
     /// Syncing state of chain sync workers.
     worker_state: WorkerState,
 
-    /// Drand randomness beacon
-    beacon: Arc<BeaconSchedule<TBeacon>>,
+    /// Custom consensus rules.
+    consensus: Arc<C>,
 
     /// manages retrieving and updates state objects
     state_manager: Arc<StateManager<DB>>,
 
-    /// Context to be able to send requests to p2p network
+    /// Context to be able to send requests to P2P network
     network: SyncNetworkContext<DB>,
 
     /// Genesis tipset
     genesis: Arc<Tipset>,
 
     /// Bad blocks cache, updates based on invalid state transitions.
-    /// Will mark any invalid blocks and all childen as bad in this bounded cache
+    /// Will mark any invalid blocks and all children as bad in this bounded cache
     bad_blocks: Arc<BadBlockCache>,
 
-    /// Incoming network events to be handled by syncer
+    /// Incoming network events to be handled by synchronizer
     net_handler: Receiver<NetworkEvent>,
-
-    /// Proof verification implementation.
-    verifier: PhantomData<V>,
 
     /// Message pool
     mpool: Arc<MessagePool<M>>,
@@ -160,17 +159,16 @@ pub struct ChainMuxer<DB, TBeacon, V, M> {
     sync_config: SyncConfig,
 }
 
-impl<DB, TBeacon, V, M> ChainMuxer<DB, TBeacon, V, M>
+impl<DB, M, C> ChainMuxer<DB, M, C>
 where
-    TBeacon: Beacon + Sync + Send + 'static,
     DB: BlockStore + Sync + Send + 'static,
-    V: ProofVerifier + Sync + Send + 'static + Unpin,
     M: Provider + Sync + Send + 'static,
+    C: Consensus,
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        consensus: Arc<C>,
         state_manager: Arc<StateManager<DB>>,
-        beacon: Arc<BeaconSchedule<TBeacon>>,
         mpool: Arc<MessagePool<M>>,
         network_send: Sender<NetworkMessage>,
         network_rx: Receiver<NetworkEvent>,
@@ -178,7 +176,7 @@ where
         tipset_sender: Sender<Arc<Tipset>>,
         tipset_receiver: Receiver<Arc<Tipset>>,
         cfg: SyncConfig,
-    ) -> Result<Self, ChainMuxerError> {
+    ) -> Result<Self, ChainMuxerError<C>> {
         let network = SyncNetworkContext::new(
             network_send,
             Default::default(),
@@ -188,13 +186,12 @@ where
         Ok(Self {
             state: ChainMuxerState::Idle,
             worker_state: Default::default(),
-            beacon,
             network,
             genesis,
+            consensus,
             state_manager,
             bad_blocks: Arc::new(BadBlockCache::default()),
             net_handler: network_rx,
-            verifier: Default::default(),
             mpool,
             tipset_sender,
             tipset_receiver,
@@ -217,7 +214,7 @@ where
         chain_store: Arc<ChainStore<DB>>,
         peer_id: PeerId,
         tipset_keys: TipsetKeys,
-    ) -> Result<FullTipset, ChainMuxerError> {
+    ) -> Result<FullTipset, ChainMuxerError<C>> {
         // Attempt to load from the store
         if let Ok(full_tipset) = Self::load_full_tipset(chain_store, tipset_keys.clone()).await {
             return Ok(full_tipset);
@@ -232,7 +229,7 @@ where
     async fn load_full_tipset(
         chain_store: Arc<ChainStore<DB>>,
         tipset_keys: TipsetKeys,
-    ) -> Result<FullTipset, ChainMuxerError> {
+    ) -> Result<FullTipset, ChainMuxerError<C>> {
         let mut blocks = Vec::new();
         // Retrieve tipset from store based on passed in TipsetKeys
         let ts = chain_store.tipset_from_keys(&tipset_keys).await?;
@@ -310,7 +307,7 @@ where
         block: GossipBlock,
         source: PeerId,
         network: SyncNetworkContext<DB>,
-    ) -> Result<FullTipset, ChainMuxerError> {
+    ) -> Result<FullTipset, ChainMuxerError<C>> {
         debug!(
             "Received block over GossipSub: {} height {} from {}",
             block.header.cid(),
@@ -322,7 +319,7 @@ where
         let bls_messages: Vec<_> = block
             .bls_messages
             .into_iter()
-            .map(|m| network.bitswap_get::<UnsignedMessage>(m))
+            .map(|m| network.bitswap_get::<Message>(m))
             .collect();
 
         // Get secp_messages in the store or over Bitswap
@@ -364,7 +361,8 @@ where
         mem_pool: Arc<MessagePool<M>>,
         genesis: Arc<Tipset>,
         message_processing_strategy: PubsubMessageProcessingStrategy,
-    ) -> Result<Option<(FullTipset, PeerId)>, ChainMuxerError> {
+        block_delay: u64,
+    ) -> Result<Option<(FullTipset, PeerId)>, ChainMuxerError<C>> {
         let (tipset, source) = match event {
             NetworkEvent::HelloRequest { request, source } => {
                 metrics::LIBP2P_MESSAGE_TOTAL
@@ -454,6 +452,7 @@ where
                 chain_store.clone(),
                 bad_block_cache.clone(),
                 genesis.clone(),
+                block_delay,
             )
             .await
         {
@@ -482,7 +481,7 @@ where
         Ok(Some((tipset, source)))
     }
 
-    fn evaluate_network_head(&self) -> ChainMuxerFuture<NetworkHeadEvaluation, ChainMuxerError> {
+    fn evaluate_network_head(&self) -> ChainMuxerFuture<NetworkHeadEvaluation, ChainMuxerError<C>> {
         let p2p_messages = self.net_handler.clone();
         let chain_store = self.state_manager.chain_store().clone();
         let network = self.network.clone();
@@ -490,6 +489,7 @@ where
         let bad_block_cache = self.bad_blocks.clone();
         let mem_pool = self.mpool.clone();
         let tipset_sample_size = self.sync_config.tipset_sample_size;
+        let block_delay = self.state_manager.chain_config().block_delay_secs;
 
         let evaluator = async move {
             let mut tipsets = vec![];
@@ -510,6 +510,7 @@ where
                     mem_pool.clone(),
                     genesis.clone(),
                     PubsubMessageProcessingStrategy::Process,
+                    block_delay,
                 )
                 .await
                 {
@@ -562,23 +563,23 @@ where
         &self,
         network_head: FullTipset,
         local_head: Arc<Tipset>,
-    ) -> ChainMuxerFuture<(), ChainMuxerError> {
+    ) -> ChainMuxerFuture<(), ChainMuxerError<C>> {
         // Instantiate a TipsetRangeSyncer
+        let trs_consensus = self.consensus.clone();
         let trs_state_manager = self.state_manager.clone();
         let trs_bad_block_cache = self.bad_blocks.clone();
         let trs_chain_store = self.state_manager.chain_store().clone();
         let trs_network = self.network.clone();
-        let trs_beacon = self.beacon.clone();
         let trs_tracker = self.worker_state.clone();
         let trs_genesis = self.genesis.clone();
-        let tipset_range_syncer: ChainMuxerFuture<(), ChainMuxerError> = Box::pin(async move {
+        let tipset_range_syncer: ChainMuxerFuture<(), ChainMuxerError<C>> = Box::pin(async move {
             let network_head_epoch = network_head.epoch();
-            let tipset_range_syncer = match TipsetRangeSyncer::<DB, TBeacon, V>::new(
+            let tipset_range_syncer = match TipsetRangeSyncer::new(
                 trs_tracker,
                 Arc::new(network_head.into_tipset()),
                 local_head,
+                trs_consensus,
                 trs_state_manager,
-                trs_beacon,
                 trs_network,
                 trs_chain_store,
                 trs_bad_block_cache,
@@ -607,7 +608,8 @@ where
         let genesis = self.genesis.clone();
         let bad_block_cache = self.bad_blocks.clone();
         let mem_pool = self.mpool.clone();
-        let stream_processor: ChainMuxerFuture<(), ChainMuxerError> = Box::pin(async move {
+        let block_delay = self.state_manager.chain_config().block_delay_secs;
+        let stream_processor: ChainMuxerFuture<(), ChainMuxerError<C>> = Box::pin(async move {
             loop {
                 let event = match p2p_messages.recv().await {
                     Ok(event) => event,
@@ -625,6 +627,7 @@ where
                     mem_pool.clone(),
                     genesis.clone(),
                     PubsubMessageProcessingStrategy::DoNotProcess,
+                    block_delay,
                 )
                 .await
                 {
@@ -657,10 +660,10 @@ where
         })
     }
 
-    fn follow(&self, tipset_opt: Option<FullTipset>) -> ChainMuxerFuture<(), ChainMuxerError> {
+    fn follow(&self, tipset_opt: Option<FullTipset>) -> ChainMuxerFuture<(), ChainMuxerError<C>> {
         // Instantiate a TipsetProcessor
+        let tp_consensus = self.consensus.clone();
         let tp_state_manager = self.state_manager.clone();
-        let tp_beacon = self.beacon.clone();
         let tp_network = self.network.clone();
         let tp_chain_store = self.state_manager.chain_store().clone();
         let tp_bad_block_cache = self.bad_blocks.clone();
@@ -670,13 +673,13 @@ where
         enum UnexpectedReturnKind {
             TipsetProcessor,
         }
-        let tipset_processor: ChainMuxerFuture<UnexpectedReturnKind, ChainMuxerError> =
+        let tipset_processor: ChainMuxerFuture<UnexpectedReturnKind, ChainMuxerError<C>> =
             Box::pin(async move {
-                TipsetProcessor::<_, _, V>::new(
+                TipsetProcessor::new(
                     tp_tracker,
                     Box::pin(tp_tipset_receiver),
+                    tp_consensus,
                     tp_state_manager,
-                    tp_beacon,
                     tp_network,
                     tp_chain_store,
                     tp_bad_block_cache,
@@ -697,7 +700,8 @@ where
         let bad_block_cache = self.bad_blocks.clone();
         let mem_pool = self.mpool.clone();
         let tipset_sender = self.tipset_sender.clone();
-        let stream_processor: ChainMuxerFuture<UnexpectedReturnKind, ChainMuxerError> = Box::pin(
+        let block_delay = self.state_manager.chain_config().block_delay_secs;
+        let stream_processor: ChainMuxerFuture<UnexpectedReturnKind, ChainMuxerError<C>> = Box::pin(
             async move {
                 // If a tipset has been provided, pass it to the tipset processor
                 if let Some(tipset) = tipset_opt {
@@ -723,6 +727,7 @@ where
                         mem_pool.clone(),
                         genesis.clone(),
                         PubsubMessageProcessingStrategy::Process,
+                        block_delay,
                     )
                     .await
                     {
@@ -787,21 +792,20 @@ where
     }
 }
 
-enum ChainMuxerState {
+enum ChainMuxerState<C: Consensus> {
     Idle,
-    Connect(ChainMuxerFuture<NetworkHeadEvaluation, ChainMuxerError>),
-    Bootstrap(ChainMuxerFuture<(), ChainMuxerError>),
-    Follow(ChainMuxerFuture<(), ChainMuxerError>),
+    Connect(ChainMuxerFuture<NetworkHeadEvaluation, ChainMuxerError<C>>),
+    Bootstrap(ChainMuxerFuture<(), ChainMuxerError<C>>),
+    Follow(ChainMuxerFuture<(), ChainMuxerError<C>>),
 }
 
-impl<DB, TBeacon, V, M> Future for ChainMuxer<DB, TBeacon, V, M>
+impl<DB, M, C> Future for ChainMuxer<DB, M, C>
 where
-    TBeacon: Beacon + Sync + Send + 'static,
     DB: BlockStore + Sync + Send + 'static,
-    V: ProofVerifier + Sync + Send + 'static + Unpin,
     M: Provider + Sync + Send + 'static,
+    C: Consensus,
 {
-    type Output = ChainMuxerError;
+    type Output = ChainMuxerError<C>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         loop {
@@ -880,7 +884,11 @@ mod tests {
 
     use crate::validation::TipsetValidator;
     use cid::Cid;
-    use db::MemoryDB;
+    use forest_blocks::{BlockHeader, Tipset};
+    use forest_db::MemoryDB;
+    use forest_message::SignedMessage;
+    use fvm_shared::{address::Address, message::Message};
+    use networks::{ChainConfig, Height};
     use test_utils::construct_messages;
 
     #[test]
@@ -898,21 +906,31 @@ mod tests {
         assert_eq!(root, expected_root);
     }
 
-    // FIXME: IPLD format changed. Figure out what this test was supposed to do.
-    // Tracking issue: https://github.com/ChainSafe/forest/issues/1477
-    // #[test]
-    // fn empty_msg_meta_vector() {
-    //     let blockstore = MemoryDB::default();
-    //     let usm: Vec<UnsignedMessage> =
-    //         encoding::from_slice(&base64::decode("gA==").unwrap()).unwrap();
-    //     let sm: Vec<SignedMessage> =
-    //         encoding::from_slice(&base64::decode("gA==").unwrap()).unwrap();
+    #[test]
+    fn empty_msg_meta_vector() {
+        let blockstore = MemoryDB::default();
+        let usm: Vec<Message> =
+            fvm_ipld_encoding::from_slice(&base64::decode("gA==").unwrap()).unwrap();
+        let sm: Vec<SignedMessage> =
+            fvm_ipld_encoding::from_slice(&base64::decode("gA==").unwrap()).unwrap();
 
-    //     assert_eq!(
-    //         TipsetValidator::compute_msg_root(&blockstore, &usm, &sm)
-    //             .expect("Computing message root should succeed")
-    //             .to_string(),
-    //         "bafy2bzacecmda75ovposbdateg7eyhwij65zklgyijgcjwynlklmqazpwlhba"
-    //     );
-    // }
+        assert_eq!(
+            TipsetValidator::compute_msg_root(&blockstore, &usm, &sm)
+                .expect("Computing message root should succeed")
+                .to_string(),
+            "bafy2bzacecmda75ovposbdateg7eyhwij65zklgyijgcjwynlklmqazpwlhba"
+        );
+    }
+
+    #[test]
+    fn compute_base_fee_shouldnt_panic_on_bad_input() {
+        let blockstore = MemoryDB::default();
+        let h0 = BlockHeader::builder()
+            .miner_address(Address::new_id(0))
+            .build()
+            .unwrap();
+        let ts = Tipset::new(vec![h0]).unwrap();
+        let smoke_height = ChainConfig::default().epoch(Height::Smoke);
+        assert!(chain::compute_base_fee(&blockstore, &ts, smoke_height).is_err());
+    }
 }

@@ -2,16 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0, MIT
 
 use super::*;
-use address::Address;
+use fvm_shared::address::Address;
 use async_std::channel::bounded;
 use async_std::task;
 use beacon::{BeaconPoint, MockBeacon};
-use blocks::BlockHeader;
+use forest_blocks::BlockHeader;
 use db::MemoryDB;
 use fil_types::verifier::MockVerifier;
 use forest_libp2p::hello::HelloRequest;
 use libp2p::core::PeerId;
 use message_pool::{test_provider::TestApi, MessagePool};
+use networks::ChainConfig;
 use state_manager::StateManager;
 use std::time::Duration;
 
@@ -26,6 +27,7 @@ fn peer_manager_update() {
         "test".to_string(),
         tx,
         Default::default(),
+        Arc::default(),
     ))
     .unwrap();
     let mpool = Arc::new(mpool);
@@ -38,8 +40,8 @@ fn peer_manager_update() {
     let dummy_header = BlockHeader::builder()
         .miner_address(Address::new_id(1000))
         .messages(msg_root)
-        .message_receipts(cid::new_from_cbor(&[1, 2, 3], Blake2b256))
-        .state_root(cid::new_from_cbor(&[1, 2, 3], Blake2b256))
+        .message_receipts(Cid::new_v1(DAG_CBOR, Blake2b256.digest(&[1, 2, 3])))
+        .state_root(Cid::new_v1(DAG_CBOR, Blake2b256.digest(&[1, 2, 3])))
         .build()
         .unwrap();
     let gen_hash = chain_store.set_genesis(&dummy_header).unwrap();
@@ -49,7 +51,7 @@ fn peer_manager_update() {
         height: 0,
         beacon: Arc::new(MockBeacon::new(Duration::from_secs(1))),
     }]));
-    let state_manager = Arc::new(StateManager::new(chain_store));
+    let state_manager = Arc::new(StateManager::new(chain_store, config.chain));
     let cs = ChainSyncer::<_, _, MockVerifier, TestApi>::new(
         state_manager,
         beacon,

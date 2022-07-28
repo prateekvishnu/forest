@@ -2,27 +2,30 @@
 // SPDX-License-Identifier: Apache-2.0, MIT
 
 use super::cli::{block_until_sigint, Config};
+use crate::cli_error_and_die;
+use async_std::net::TcpListener;
+use async_std::task::JoinHandle;
 use auth::{create_token, generate_priv_key, ADMIN, JWT_IDENTIFIER};
 use chain::ChainStore;
+use chain_sync::consensus::SyncGossipSubmitter;
 use chain_sync::ChainMuxer;
-use fil_types::verifier::FullVerifier;
-use forest_libp2p::{get_keypair, Libp2pService};
+use fil_types::{verifier::FullVerifier, NetworkVersion};
+use forest_libp2p::{get_keypair, Libp2pConfig, Libp2pService};
 use genesis::{get_network_name_from_genesis, import_chain, read_genesis_header};
+use key_management::ENCRYPTED_KEYSTORE_NAME;
+use key_management::{KeyStore, KeyStoreConfig};
 use message_pool::{MessagePool, MpoolConfig, MpoolRpcProvider};
-use paramfetch::{get_params_default, SectorSizeOpt};
 use rpc::start_rpc;
 use rpc_api::data_types::RPCState;
 use state_manager::StateManager;
 use utils::write_to_file;
-use wallet::ENCRYPTED_KEYSTORE_NAME;
-use wallet::{KeyStore, KeyStoreConfig};
 
 use async_std::{channel::bounded, sync::RwLock, task};
 use libp2p::identity::{ed25519, Keypair};
 use log::{debug, error, info, trace, warn};
 use rpassword::read_password;
 
-use db::rocks::RocksDb;
+use forest_db::rocks::RocksDb;
 use std::io::prelude::*;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,22 +33,12 @@ use std::time;
 
 /// Starts daemon process
 pub(super) async fn start(config: Config) {
-    // Set the Address network prefix
-    #[cfg(any(feature = "testnet"))]
-    address::NETWORK_DEFAULT
-        .set(address::Network::Testnet)
-        .unwrap();
-    #[cfg(not(feature = "testnet"))]
-    address::NETWORK_DEFAULT
-        .set(address::Network::Mainnet)
-        .unwrap();
-
     info!(
         "Starting Forest daemon, version {}",
         option_env!("FOREST_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
     );
 
-    let path: PathBuf = [&config.data_dir, "libp2p"].iter().collect();
+    let path: PathBuf = config.data_dir.join("libp2p");
     let net_keypair = get_keypair(&path.join("keypair")).unwrap_or_else(|| {
         // Keypair not found, generate and save generated keypair
         let gen_keypair = ed25519::Keypair::generate();
@@ -107,12 +100,15 @@ pub(super) async fn start(config: Config) {
     }
 
     // Start Prometheus server port
+    let prometheus_listener = TcpListener::bind(config.metrics_address)
+        .await
+        .unwrap_or_else(|_| {
+            cli_error_and_die(format!("could not bind to {}", config.metrics_address), 1)
+        });
+    info!("Prometheus server started at {}", config.metrics_address);
     let prometheus_server_task = task::spawn(metrics::init_prometheus(
-        (format!("127.0.0.1:{}", config.metrics_port))
-            .parse()
-            .unwrap(),
-        PathBuf::from(&config.data_dir)
-            .join("db")
+        prometheus_listener,
+        db_path(&config)
             .into_os_string()
             .into_string()
             .expect("Failed converting the path to db"),
@@ -125,13 +121,7 @@ pub(super) async fn start(config: Config) {
 
     let keystore = Arc::new(RwLock::new(ks));
 
-    // Initialize database (RocksDb will be default if both features enabled)
-    #[cfg(all(feature = "sled", not(feature = "rocksdb")))]
-    let db = db::sled::SledDb::open(format!("{}/{}", config.data_dir, "/sled"))
-        .expect("Opening SledDB must succeed");
-
-    #[cfg(feature = "rocksdb")]
-    let db = db::rocks::RocksDb::open(PathBuf::from(&config.data_dir).join("db"), &config.rocks_db)
+    let db = forest_db::rocks::RocksDb::open(db_path(&config), &config.rocks_db)
         .expect("Opening RocksDB must succeed");
 
     let db = Arc::new(db);
@@ -143,13 +133,19 @@ pub(super) async fn start(config: Config) {
 
     // Read Genesis file
     // * When snapshot command implemented, this genesis does not need to be initialized
-    let genesis = read_genesis_header(config.genesis_file.as_ref(), &chain_store)
-        .await
-        .unwrap();
+    let genesis = read_genesis_header(
+        config.genesis_file.as_ref(),
+        config.chain.genesis_bytes(),
+        &chain_store,
+    )
+    .await
+    .unwrap();
     chain_store.set_genesis(&genesis.blocks()[0]).unwrap();
 
     // Initialize StateManager
-    let sm = StateManager::new(Arc::clone(&chain_store)).await.unwrap();
+    let sm = StateManager::new(Arc::clone(&chain_store), Arc::clone(&config.chain))
+        .await
+        .unwrap();
     let state_manager = Arc::new(sm);
 
     let network_name = get_network_name_from_genesis(&genesis, &state_manager)
@@ -160,10 +156,55 @@ pub(super) async fn start(config: Config) {
 
     sync_from_snapshot(&config, &state_manager).await;
 
+    // Terminate if no snapshot is provided or DB isn't recent enough
+    match chain_store.heaviest_tipset().await {
+        None => {
+            cli_error_and_die(
+                "Forest cannot sync without a snapshot. Download a snapshot from a trusted source and import with --import-snapshot=[file]",
+                1,
+            );
+        }
+        Some(tipset) => {
+            let epoch = tipset.epoch();
+            let nv = config.chain.network_version(epoch);
+            if nv < NetworkVersion::V16 {
+                cli_error_and_die(
+                   "Database too old. Download a snapshot from a trusted source and import with --import-snapshot=[file]",
+                    1,
+                );
+            }
+        }
+    }
+
     // Fetch and ensure verification keys are downloaded
-    get_params_default(SectorSizeOpt::Keys, false)
-        .await
-        .unwrap();
+    #[cfg(all(feature = "fil_cns", not(any(feature = "deleg_cns"))))]
+    {
+        use paramfetch::{get_params_default, set_proofs_parameter_cache_dir_env, SectorSizeOpt};
+        set_proofs_parameter_cache_dir_env(&config.data_dir);
+
+        get_params_default(&config.data_dir, SectorSizeOpt::Keys, false)
+            .await
+            .unwrap();
+    }
+
+    // Override bootstrap peers
+    let config = if config.network.bootstrap_peers.is_empty() {
+        let bootstrap_peers = config
+            .chain
+            .bootstrap_peers
+            .iter()
+            .map(|node| node.parse().unwrap())
+            .collect();
+        Config {
+            network: Libp2pConfig {
+                bootstrap_peers,
+                ..config.network
+            },
+            ..config
+        }
+    } else {
+        config
+    };
 
     // Libp2p service setup
     let p2p_service = Libp2pService::new(
@@ -175,6 +216,8 @@ pub(super) async fn start(config: Config) {
     let network_rx = p2p_service.network_receiver();
     let network_send = p2p_service.network_sender();
 
+    let (tipset_sink, tipset_stream) = bounded(20);
+
     // Initialize mpool
     let provider = MpoolRpcProvider::new(publisher.clone(), Arc::clone(&state_manager));
     let mpool = Arc::new(
@@ -183,17 +226,61 @@ pub(super) async fn start(config: Config) {
             network_name.clone(),
             network_send.clone(),
             MpoolConfig::load_config(db.as_ref()).unwrap(),
+            Arc::clone(state_manager.chain_config()),
         )
         .await
         .unwrap(),
     );
 
+    // Mining may or may not happen, depending on the consensus type.
+    let mining_task: Option<JoinHandle<anyhow::Result<()>>>;
+
+    // For consensus types that do mining, create a component to submit their proposals.
+    let submitter = SyncGossipSubmitter::new(
+        network_name.clone(),
+        network_send.clone(),
+        tipset_sink.clone(),
+    );
+
+    // Initialize Consensus
+    #[cfg(not(any(feature = "fil_cns", feature = "deleg_cns")))]
+    compile_error!("No consensus feature enabled; use e.g. `--feature fil_cns` to pick one.");
+
+    #[cfg(all(feature = "fil_cns", not(any(feature = "deleg_cns"))))]
+    type FullConsensus = fil_cns::FilecoinConsensus<beacon::DrandBeacon, FullVerifier>;
+    #[cfg(all(feature = "fil_cns", not(any(feature = "deleg_cns"))))]
+    let consensus: FullConsensus = {
+        mining_task = None;
+        drop(submitter);
+        fil_cns::FilecoinConsensus::new(state_manager.beacon_schedule())
+    };
+    #[cfg(feature = "deleg_cns")]
+    type FullConsensus = deleg_cns::DelegatedConsensus;
+    #[cfg(feature = "deleg_cns")]
+    let consensus: FullConsensus = {
+        use chain_sync::consensus::Proposer;
+        use futures::TryFutureExt;
+        let consensus = deleg_cns::DelegatedConsensus::default();
+        if let Some(proposer) = consensus.proposer(&keystore, &state_manager).await.unwrap() {
+            let sm = state_manager.clone();
+            let mp = mpool.clone();
+            mining_task = Some(task::spawn(async move {
+                proposer
+                    .run(sm, mp.as_ref(), &submitter)
+                    .inspect_err(|e| error!("block proposal stopped: {}", e))
+                    .await
+            }));
+        } else {
+            mining_task = None
+        }
+        consensus
+    };
+
     // Initialize ChainMuxer
-    let (tipset_sink, tipset_stream) = bounded(20);
     let chain_muxer_tipset_sink = tipset_sink.clone();
-    let chain_muxer = ChainMuxer::<_, _, FullVerifier, _>::new(
+    let chain_muxer = ChainMuxer::new(
+        Arc::new(consensus),
         Arc::clone(&state_manager),
-        state_manager.beacon_schedule(),
         Arc::clone(&mpool),
         network_send.clone(),
         network_rx,
@@ -213,10 +300,13 @@ pub(super) async fn start(config: Config) {
     });
     let rpc_task = if config.enable_rpc {
         let keystore_rpc = Arc::clone(&keystore);
-        let rpc_listen = format!("127.0.0.1:{}", &config.rpc_port);
+        let rpc_listen = TcpListener::bind(&config.rpc_address)
+            .await
+            .unwrap_or_else(|_| cli_error_and_die("could not bind to {rpc_address}", 1));
+
         Some(task::spawn(async move {
-            info!("JSON-RPC endpoint started at {}", &rpc_listen);
-            start_rpc::<_, _, FullVerifier>(
+            info!("JSON-RPC endpoint started at {}", config.rpc_address);
+            start_rpc::<_, _, FullVerifier, FullConsensus>(
                 Arc::new(RPCState {
                     state_manager: Arc::clone(&state_manager),
                     keystore: keystore_rpc,
@@ -229,7 +319,7 @@ pub(super) async fn start(config: Config) {
                     chain_store,
                     new_mined_block_tx: tipset_sink,
                 }),
-                &rpc_listen,
+                rpc_listen,
             )
             .await
         }))
@@ -246,12 +336,11 @@ pub(super) async fn start(config: Config) {
     });
 
     // Cancel all async services
+    maybe_cancel(mining_task).await;
     prometheus_server_task.cancel().await;
     sync_task.cancel().await;
     p2p_task.cancel().await;
-    if let Some(task) = rpc_task {
-        task.cancel().await;
-    }
+    maybe_cancel(rpc_task).await;
     keystore_write.await;
 
     info!("Forest finish shutdown.");
@@ -260,7 +349,11 @@ pub(super) async fn start(config: Config) {
 async fn sync_from_snapshot(config: &Config, state_manager: &Arc<StateManager<RocksDb>>) {
     if let Some(path) = &config.snapshot_path {
         let stopwatch = time::Instant::now();
-        let validate_height = if config.snapshot { None } else { Some(0) };
+        let validate_height = if config.snapshot {
+            config.snapshot_height
+        } else {
+            Some(0)
+        };
         import_chain::<FullVerifier, _>(state_manager, path, validate_height, config.skip_load)
             .await
             .expect("Failed miserably while importing chain from snapshot");
@@ -268,13 +361,28 @@ async fn sync_from_snapshot(config: &Config, state_manager: &Arc<StateManager<Ro
     }
 }
 
+async fn maybe_cancel<R>(mt: Option<JoinHandle<R>>) {
+    if let Some(t) = mt {
+        t.cancel().await;
+    }
+}
+
+fn db_path(config: &Config) -> PathBuf {
+    chain_path(config).join("db")
+}
+
+fn chain_path(config: &Config) -> PathBuf {
+    PathBuf::from(&config.data_dir).join(&config.chain.name)
+}
+
 #[cfg(test)]
 #[cfg(not(any(feature = "interopnet", feature = "devnet")))]
 mod test {
     use super::*;
-    use address::Address;
-    use blocks::BlockHeader;
-    use db::MemoryDB;
+    use forest_blocks::BlockHeader;
+    use forest_db::MemoryDB;
+    use fvm_shared::address::Address;
+    use networks::ChainConfig;
 
     #[async_std::test]
     async fn import_snapshot_from_file() {
@@ -286,7 +394,8 @@ mod test {
             .build()
             .unwrap();
         cs.set_genesis(&genesis_header).unwrap();
-        let sm = Arc::new(StateManager::new(cs).await.unwrap());
+        let chain_config = Arc::new(ChainConfig::default());
+        let sm = Arc::new(StateManager::new(cs, chain_config).await.unwrap());
         import_chain::<FullVerifier, _>(&sm, "test_files/chain4.car", None, false)
             .await
             .expect("Failed to import chain");

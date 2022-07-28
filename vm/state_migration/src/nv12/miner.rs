@@ -13,7 +13,7 @@ use actor_interface::actorv3::miner::State as V3State;
 use actor_interface::actorv4::miner::State as V4State;
 use async_std::sync::Arc;
 use cid::Cid;
-use cid::Code::Blake2b256;
+use cid::multihash::Code::Blake2b256;
 use ipld_blockstore::BlockStore;
 
 pub struct MinerMigrator(Cid);

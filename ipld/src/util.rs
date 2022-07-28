@@ -2,10 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0, MIT
 
 use std::collections::HashSet;
-use std::error::Error as StdError;
 
 use cid::Cid;
-use fvm_shared::encoding::from_slice;
+use fvm_ipld_encoding::from_slice;
 
 use crate::Ipld;
 
@@ -15,9 +14,9 @@ fn traverse_ipld_links<F>(
     walked: &mut HashSet<Cid>,
     load_block: &mut F,
     ipld: &Ipld,
-) -> Result<(), Box<dyn StdError>>
+) -> Result<(), anyhow::Error>
 where
-    F: FnMut(Cid) -> Result<Vec<u8>, Box<dyn StdError>>,
+    F: FnMut(Cid) -> Result<Vec<u8>, anyhow::Error>,
 {
     match ipld {
         Ipld::Map(m) => {
@@ -31,7 +30,14 @@ where
             }
         }
         Ipld::Link(cid) => {
-            if cid.codec() == cid::DAG_CBOR {
+            // WASM blocks are stored as IPLD_RAW. They should be loaded but not traversed.
+            if cid.codec() == fvm_shared::IPLD_RAW {
+                if !walked.insert(*cid) {
+                    return Ok(());
+                }
+                let _ = load_block(*cid)?;
+            }
+            if cid.codec() == fvm_ipld_encoding::DAG_CBOR {
                 if !walked.insert(*cid) {
                     return Ok(());
                 }
@@ -50,15 +56,15 @@ pub fn recurse_links<F>(
     walked: &mut HashSet<Cid>,
     root: Cid,
     load_block: &mut F,
-) -> Result<(), Box<dyn StdError>>
+) -> Result<(), anyhow::Error>
 where
-    F: FnMut(Cid) -> Result<Vec<u8>, Box<dyn StdError>>,
+    F: FnMut(Cid) -> Result<Vec<u8>, anyhow::Error>,
 {
     if !walked.insert(root) {
         // Cid has already been traversed
         return Ok(());
     }
-    if root.codec() != cid::DAG_CBOR {
+    if root.codec() != fvm_ipld_encoding::DAG_CBOR {
         return Ok(());
     }
 

@@ -12,18 +12,18 @@ use crate::msg_chain::{create_message_chains, Chains};
 use crate::msg_pool::MsgSet;
 use crate::msg_pool::{add_helper, remove};
 use crate::provider::Provider;
-use address::Address;
 use async_std::channel::Sender;
 use async_std::sync::{Arc, RwLock};
-use blocks::Tipset;
 use cid::Cid;
-use crypto::Signature;
-use encoding::Cbor;
+use forest_blocks::Tipset;
 use forest_libp2p::{NetworkMessage, Topic, PUBSUB_MSG_STR};
+use forest_message::{Message as MessageTrait, SignedMessage};
+use fvm_ipld_encoding::Cbor;
+use fvm_shared::address::Address;
+use fvm_shared::crypto::signature::Signature;
 use log::error;
 use lru::LruCache;
-use message::{Message, SignedMessage};
-use networks::BLOCK_DELAY_SECS;
+use networks::ChainConfig;
 use std::collections::{HashMap, HashSet};
 use std::{borrow::BorrowMut, cmp::Ordering};
 use tokio::sync::broadcast::{Receiver as Subscriber, Sender as Publisher};
@@ -36,11 +36,10 @@ const BASE_FEE_LOWER_BOUND_FACTOR_CONSERVATIVE: i64 = 100;
 const BASE_FEE_LOWER_BOUND_FACTOR: i64 = 10;
 const REPUB_MSG_LIMIT: usize = 30;
 const PROPAGATION_DELAY_SECS: u64 = 6;
-const REPUBLISH_INTERVAL: u64 = 10 * BLOCK_DELAY_SECS + PROPAGATION_DELAY_SECS;
 // TODO: Implement guess gas module
 const MIN_GAS: i64 = 1298450;
 
-/// Get the state of the base_sequence for a given address in the current Tipset
+/// Get the state of the `base_sequence` for a given address in the current Tipset
 async fn get_state_sequence<T>(
     api: &RwLock<T>,
     addr: &Address,
@@ -55,6 +54,7 @@ where
     Ok(base_sequence)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn republish_pending_messages<T>(
     api: &RwLock<T>,
     network_sender: &Sender<NetworkMessage>,
@@ -63,16 +63,17 @@ async fn republish_pending_messages<T>(
     cur_tipset: &RwLock<Arc<Tipset>>,
     republished: &RwLock<HashSet<Cid>>,
     local_addrs: &RwLock<Vec<Address>>,
+    chain_config: &Arc<ChainConfig>,
 ) -> Result<(), Error>
 where
     T: Provider,
 {
     let ts = cur_tipset.read().await;
-    let base_fee = api.read().await.chain_compute_base_fee(&ts)?;
-    let base_fee_lower_bound = get_base_fee_lower_bound(&base_fee, BASE_FEE_LOWER_BOUND_FACTOR);
     let mut pending_map: HashMap<Address, HashMap<u64, SignedMessage>> = HashMap::new();
 
     republished.write().await.clear();
+
+    // Only republish messages from local addresses, ie. transactions which were sent to this node directly.
     let local_addrs = local_addrs.read().await;
     for actor in local_addrs.iter() {
         if let Some(mset) = pending.read().await.get(actor) {
@@ -88,23 +89,72 @@ where
     }
     drop(local_addrs);
 
-    if pending_map.is_empty() {
-        return Ok(());
+    let msgs = select_messages_for_block(api, chain_config, ts.as_ref(), pending_map).await?;
+
+    drop(ts);
+
+    for m in msgs.iter() {
+        let mb = m.marshal_cbor()?;
+        network_sender
+            .send(NetworkMessage::PubsubMessage {
+                topic: Topic::new(format!("{}/{}", PUBSUB_MSG_STR, network_name)),
+                message: mb,
+            })
+            .await
+            .map_err(|_| Error::Other("Network receiver dropped".to_string()))?;
+    }
+
+    let mut republished_t = HashSet::new();
+    for m in msgs.iter() {
+        republished_t.insert(m.cid()?);
+    }
+    *republished.write().await = republished_t;
+
+    Ok(())
+}
+
+/// Select messages from the mempool to be included in the next block that builds on
+/// a given base tipset. The messages should be eligible for inclusion based on their
+/// sequences and the overall number of them should observe block gas limits.
+async fn select_messages_for_block<T>(
+    api: &RwLock<T>,
+    chain_config: &ChainConfig,
+    base: &Tipset,
+    pending: HashMap<Address, HashMap<u64, SignedMessage>>,
+) -> Result<Vec<SignedMessage>, Error>
+where
+    T: Provider,
+{
+    let mut msgs: Vec<SignedMessage> = vec![];
+
+    let base_fee = api.read().await.chain_compute_base_fee(base)?;
+    let base_fee_lower_bound = get_base_fee_lower_bound(&base_fee, BASE_FEE_LOWER_BOUND_FACTOR);
+
+    if pending.is_empty() {
+        return Ok(msgs);
     }
 
     let mut chains = Chains::new();
-    for (actor, mset) in pending_map.iter() {
-        create_message_chains(api, actor, mset, &base_fee_lower_bound, &ts, &mut chains).await?;
+    for (actor, mset) in pending.iter() {
+        create_message_chains(
+            api,
+            actor,
+            mset,
+            &base_fee_lower_bound,
+            base,
+            &mut chains,
+            chain_config,
+        )
+        .await?;
     }
 
     if chains.is_empty() {
-        return Ok(());
+        return Ok(msgs);
     }
 
     chains.sort(false);
 
-    let mut msgs: Vec<SignedMessage> = vec![];
-    let mut gas_limit = types::BLOCK_GAS_LIMIT;
+    let mut gas_limit = fil_types::BLOCK_GAS_LIMIT;
     let mut i = 0;
     'l: while i < chains.len() {
         let chain = &mut chains[i];
@@ -153,25 +203,8 @@ where
             j += 1;
         }
     }
-    drop(ts);
-    for m in msgs.iter() {
-        let mb = m.marshal_cbor()?;
-        network_sender
-            .send(NetworkMessage::PubsubMessage {
-                topic: Topic::new(format!("{}/{}", PUBSUB_MSG_STR, network_name)),
-                message: mb,
-            })
-            .await
-            .map_err(|_| Error::Other("Network receiver dropped".to_string()))?;
-    }
 
-    let mut republished_t = HashSet::new();
-    for m in msgs.iter() {
-        republished_t.insert(m.cid()?);
-    }
-    *republished.write().await = republished_t;
-
-    Ok(())
+    Ok(msgs)
 }
 
 /// This function will revert and/or apply tipsets to the message pool. This function should be
@@ -224,7 +257,7 @@ where
                 }
             }
             for msg in msgs {
-                remove_from_selected_msgs(msg.from(), pending, msg.sequence(), rmsgs.borrow_mut())
+                remove_from_selected_msgs(&msg.from, pending, msg.sequence, rmsgs.borrow_mut())
                     .await?;
                 if !repub && republished.write().await.insert(msg.cid()?) {
                     repub = true;
@@ -251,8 +284,8 @@ where
     Ok(())
 }
 
-/// This is a helper function for head_change. This method will remove a sequence for a from address
-/// from the messages selected by priority hashmap. It also removes the 'from' address and sequence from the MessagePool.
+/// This is a helper function for `head_change`. This method will remove a sequence for a from address
+/// from the messages selected by priority hash-map. It also removes the 'from' address and sequence from the `MessagePool`.
 pub(crate) async fn remove_from_selected_msgs(
     from: &Address,
     pending: &RwLock<HashMap<Address, MsgSet>>,
@@ -271,8 +304,8 @@ pub(crate) async fn remove_from_selected_msgs(
     Ok(())
 }
 
-/// This is a helper function for head_change. This method will add a signed message to
-/// the given messages selected by priority HashMap.
+/// This is a helper function for `head_change`. This method will add a signed message to
+/// the given messages selected by priority `HashMap`.
 pub(crate) fn add_to_selected_msgs(
     m: SignedMessage,
     rmsgs: &mut HashMap<Address, HashMap<u64, SignedMessage>>,
@@ -291,14 +324,16 @@ pub mod tests {
     use super::*;
     use crate::msg_chain::{create_message_chains, Chains};
     use crate::msg_pool::MessagePool;
-    use address::Address;
     use async_std::channel::bounded;
     use async_std::task;
-    use blocks::Tipset;
-    use crypto::SignatureType;
+    use forest_blocks::Tipset;
+    use forest_message::SignedMessage;
+    use fvm_shared::address::Address;
+    use fvm_shared::bigint::BigInt;
+    use fvm_shared::crypto::signature::SignatureType;
+    use fvm_shared::message::Message;
     use key_management::{KeyStore, KeyStoreConfig, Wallet};
-    use message::{SignedMessage, UnsignedMessage};
-    use num_bigint::BigInt;
+    use networks::ChainConfig;
     use std::borrow::BorrowMut;
     use std::thread::sleep;
     use std::time::Duration;
@@ -312,15 +347,15 @@ pub mod tests {
         gas_limit: i64,
         gas_price: u64,
     ) -> SignedMessage {
-        let umsg: UnsignedMessage = UnsignedMessage::builder()
-            .to(*to)
-            .from(*from)
-            .sequence(sequence)
-            .gas_limit(gas_limit)
-            .gas_fee_cap((gas_price + 100).into())
-            .gas_premium(gas_price.into())
-            .build()
-            .unwrap();
+        let umsg = Message {
+            to: *to,
+            from: *from,
+            sequence,
+            gas_limit,
+            gas_fee_cap: (gas_price + 100).into(),
+            gas_premium: gas_price.into(),
+            ..Message::default()
+        };
         let msg_signing_bytes = umsg.to_signing_bytes();
         let sig = wallet.sign(from, msg_signing_bytes.as_slice()).unwrap();
         SignedMessage::new_from_parts(umsg, sig).unwrap()
@@ -337,9 +372,15 @@ pub mod tests {
 
         task::block_on(async move {
             let (tx, _rx) = bounded(50);
-            let mpool = MessagePool::new(tma, "mptest".to_string(), tx, Default::default())
-                .await
-                .unwrap();
+            let mpool = MessagePool::new(
+                tma,
+                "mptest".to_string(),
+                tx,
+                Default::default(),
+                Arc::default(),
+            )
+            .await
+            .unwrap();
             let mut smsg_vec = Vec::new();
             for i in 0..2 {
                 let msg = create_smsg(&target, &sender, wallet.borrow_mut(), i, 1000000, 1);
@@ -401,9 +442,15 @@ pub mod tests {
         let (tx, _rx) = bounded(50);
 
         task::block_on(async move {
-            let mpool = MessagePool::new(tma, "mptest".to_string(), tx, Default::default())
-                .await
-                .unwrap();
+            let mpool = MessagePool::new(
+                tma,
+                "mptest".to_string(),
+                tx,
+                Default::default(),
+                Arc::default(),
+            )
+            .await
+            .unwrap();
 
             let mut api_temp = mpool.api.write().await;
             api_temp.set_block_messages(&a, vec![smsg_vec[0].clone()]);
@@ -495,9 +542,15 @@ pub mod tests {
         let (tx, _rx) = bounded(50);
 
         task::block_on(async move {
-            let mpool = MessagePool::new(tma, "mptest".to_string(), tx, Default::default())
-                .await
-                .unwrap();
+            let mpool = MessagePool::new(
+                tma,
+                "mptest".to_string(),
+                tx,
+                Default::default(),
+                Arc::default(),
+            )
+            .await
+            .unwrap();
 
             let mut smsg_vec = Vec::new();
             for i in 0..3 {
@@ -544,6 +597,7 @@ pub mod tests {
             let tma = RwLock::new(tma);
             let a = mock_block(1, 1);
             let ts = Tipset::new(vec![a]).unwrap();
+            let chain_config = ChainConfig::default();
 
             // --- Test Chain Aggregations ---
             // Test 1: 10 messages from a1 to a2, with increasing gasPerf; it should
@@ -557,9 +611,17 @@ pub mod tests {
             }
 
             let mut chains = Chains::new();
-            create_message_chains(&tma, &a1, &mset, &BigInt::from(0i64), &ts, &mut chains)
-                .await
-                .unwrap();
+            create_message_chains(
+                &tma,
+                &a1,
+                &mset,
+                &BigInt::from(0i64),
+                &ts,
+                &mut chains,
+                &chain_config,
+            )
+            .await
+            .unwrap();
             assert_eq!(chains.len(), 1, "expected a single chain");
             assert_eq!(
                 chains[0].msgs.len(),
@@ -587,9 +649,17 @@ pub mod tests {
                 mset.insert(i, msg);
             }
             let mut chains = Chains::new();
-            create_message_chains(&tma, &a1, &mset, &BigInt::from(0i64), &ts, &mut chains)
-                .await
-                .unwrap();
+            create_message_chains(
+                &tma,
+                &a1,
+                &mset,
+                &BigInt::from(0i64),
+                &ts,
+                &mut chains,
+                &chain_config,
+            )
+            .await
+            .unwrap();
             assert_eq!(chains.len(), 10, "expected 10 chains");
 
             for i in 0..chains.len() {
@@ -623,9 +693,17 @@ pub mod tests {
                 mset.insert(i, msg);
             }
             let mut chains = Chains::new();
-            create_message_chains(&tma, &a1, &mset, &BigInt::from(0i64), &ts, &mut chains)
-                .await
-                .unwrap();
+            create_message_chains(
+                &tma,
+                &a1,
+                &mset,
+                &BigInt::from(0i64),
+                &ts,
+                &mut chains,
+                &chain_config,
+            )
+            .await
+            .unwrap();
             assert_eq!(chains.len(), 2, "expected 2 chains");
             assert_eq!(chains[0].msgs.len(), 9);
             assert_eq!(chains[1].msgs.len(), 1);
@@ -663,9 +741,17 @@ pub mod tests {
             }
 
             let mut chains = Chains::new();
-            create_message_chains(&tma, &a1, &mset, &BigInt::from(0i32), &ts, &mut chains)
-                .await
-                .unwrap();
+            create_message_chains(
+                &tma,
+                &a1,
+                &mset,
+                &BigInt::from(0i32),
+                &ts,
+                &mut chains,
+                &chain_config,
+            )
+            .await
+            .unwrap();
 
             for i in 0..chains.len() {
                 let expected_len = if i > 2 { 1 } else { 3 };
@@ -705,9 +791,17 @@ pub mod tests {
             }
 
             let mut chains = Chains::new();
-            create_message_chains(&tma, &a1, &mset, &BigInt::from(0i32), &ts, &mut chains)
-                .await
-                .unwrap();
+            create_message_chains(
+                &tma,
+                &a1,
+                &mset,
+                &BigInt::from(0i32),
+                &ts,
+                &mut chains,
+                &chain_config,
+            )
+            .await
+            .unwrap();
             assert_eq!(chains.len(), 1, "expected a single chain");
             for (i, m) in chains[0].msgs.iter().enumerate() {
                 assert_eq!(
@@ -736,9 +830,17 @@ pub mod tests {
                 mset.insert(i, msg);
             }
             let mut chains = Chains::new();
-            create_message_chains(&tma, &a1, &mset, &BigInt::from(0i32), &ts, &mut chains)
-                .await
-                .unwrap();
+            create_message_chains(
+                &tma,
+                &a1,
+                &mset,
+                &BigInt::from(0i32),
+                &ts,
+                &mut chains,
+                &chain_config,
+            )
+            .await
+            .unwrap();
             assert_eq!(chains.len(), 1, "expected a single chain");
             assert_eq!(chains[0].msgs.len(), 5);
             for (i, m) in chains[0].msgs.iter().enumerate() {
@@ -755,7 +857,7 @@ pub mod tests {
             //         gasPerf; it should create a single chain with the max messages
             let mut mset = HashMap::new();
             let mut smsg_vec = Vec::new();
-            let max_messages = types::BLOCK_GAS_LIMIT / gas_limit;
+            let max_messages = fil_types::BLOCK_GAS_LIMIT / gas_limit;
             let n_messages = max_messages + 1;
             for i in 0..n_messages {
                 let msg = create_smsg(
@@ -770,9 +872,17 @@ pub mod tests {
                 mset.insert(i as u64, msg);
             }
             let mut chains = Chains::new();
-            create_message_chains(&tma, &a1, &mset, &BigInt::from(0i32), &ts, &mut chains)
-                .await
-                .unwrap();
+            create_message_chains(
+                &tma,
+                &a1,
+                &mset,
+                &BigInt::from(0i32),
+                &ts,
+                &mut chains,
+                &chain_config,
+            )
+            .await
+            .unwrap();
             assert_eq!(chains.len(), 1, "expected a single chain");
             assert_eq!(chains[0].msgs.len(), max_messages as usize);
             for (i, m) in chains[0].msgs.iter().enumerate() {
@@ -797,9 +907,17 @@ pub mod tests {
                 mset.insert(i as u64, msg);
             }
             let mut chains = Chains::new();
-            create_message_chains(&tma, &a1, &mset, &BigInt::from(0i32), &ts, &mut chains)
-                .await
-                .unwrap();
+            create_message_chains(
+                &tma,
+                &a1,
+                &mset,
+                &BigInt::from(0i32),
+                &ts,
+                &mut chains,
+                &chain_config,
+            )
+            .await
+            .unwrap();
             assert_eq!(chains.len(), 1, "expected a single chain");
             assert_eq!(chains[0].msgs.len(), 2);
             for (i, m) in chains[0].msgs.iter().enumerate() {

@@ -1,29 +1,30 @@
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
-//! Contains mock implementations for testing internal MessagePool APIs
+//! Contains mock implementations for testing internal `MessagePool` APIs
 
 use crate::msgpool::{Publisher, Subscriber};
 use crate::provider::Provider;
 use crate::Error;
-use address::{Address, Protocol};
 use async_std::sync::Arc;
 use async_trait::async_trait;
-use blocks::TipsetKeys;
-use blocks::{BlockHeader, ElectionProof, Ticket, Tipset};
 use chain::HeadChange;
 use cid::Cid;
-use crypto::VRFProof;
-use message::ChainMessage;
-use message::Message;
-use message::{SignedMessage, UnsignedMessage};
-use num_bigint::BigInt;
+use forest_blocks::TipsetKeys;
+use forest_blocks::{BlockHeader, ElectionProof, Ticket, Tipset};
+use forest_crypto::VRFProof;
+use forest_message::ChainMessage;
+use forest_message::Message as MessageTrait;
+use forest_message::SignedMessage;
+use fvm::state_tree::ActorState;
+use fvm_shared::address::{Address, Protocol};
+use fvm_shared::bigint::BigInt;
+use fvm_shared::message::Message;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use tokio::sync::broadcast;
-use vm::ActorState;
 
-/// Struct used for creating a provider when writing tests involving message pool
+/// Structure used for creating a provider when writing tests involving message pool
 pub struct TestApi {
     bmsgs: HashMap<Cid, Vec<SignedMessage>>,
     state_sequence: HashMap<Address, u64>,
@@ -33,7 +34,7 @@ pub struct TestApi {
 }
 
 impl Default for TestApi {
-    /// Create a new TestApi
+    /// Create a new `TestApi`
     fn default() -> Self {
         let (publisher, _) = broadcast::channel(1);
         TestApi {
@@ -47,23 +48,23 @@ impl Default for TestApi {
 }
 
 impl TestApi {
-    /// Set the state sequence for an Address for TestApi
+    /// Set the state sequence for an Address for `TestApi`
     pub fn set_state_sequence(&mut self, addr: &Address, sequence: u64) {
         self.state_sequence.insert(*addr, sequence);
     }
 
-    /// Set the state balance for an Address for TestApi
+    /// Set the state balance for an Address for `TestApi`
     pub fn set_state_balance_raw(&mut self, addr: &Address, bal: BigInt) {
         self.balances.insert(*addr, bal);
     }
 
-    /// Set the block messages for TestApi
+    /// Set the block messages for `TestApi`
     pub fn set_block_messages(&mut self, h: &BlockHeader, msgs: Vec<SignedMessage>) {
         self.bmsgs.insert(*h.cid(), msgs);
         self.tipsets.push(Tipset::new(vec![h.clone()]).unwrap())
     }
 
-    /// Set the heaviest tipset for TestApi
+    /// Set the heaviest tipset for `TestApi`
     pub async fn set_heaviest_tipset(&mut self, ts: Arc<Tipset>) {
         self.publisher.send(HeadChange::Apply(ts)).unwrap();
     }
@@ -125,8 +126,8 @@ impl Provider for TestApi {
     fn messages_for_block(
         &self,
         h: &BlockHeader,
-    ) -> Result<(Vec<UnsignedMessage>, Vec<SignedMessage>), Error> {
-        let v: Vec<UnsignedMessage> = Vec::new();
+    ) -> Result<(Vec<Message>, Vec<SignedMessage>), Error> {
+        let v: Vec<Message> = Vec::new();
         let thing = self.bmsgs.get(h.cid());
 
         match thing {
@@ -138,11 +139,7 @@ impl Provider for TestApi {
         }
     }
 
-    async fn state_account_key<V>(
-        &self,
-        addr: &Address,
-        _ts: &Arc<Tipset>,
-    ) -> Result<Address, Error> {
+    async fn state_account_key(&self, addr: &Address, _ts: &Arc<Tipset>) -> Result<Address, Error> {
         match addr.protocol() {
             Protocol::BLS | Protocol::Secp256k1 => Ok(*addr),
             _ => Err(Error::Other("given address was not a key addr".to_string())),

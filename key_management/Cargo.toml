@@ -1,5 +1,5 @@
 [package]
-name = "key_management"
+name    = "key_management"
 version = "0.1.0"
 authors = ["ChainSafe Systems <info@chainsafe.io>"]
 edition = "2021"
@@ -9,12 +9,13 @@ features = ["json"]
 
 [dependencies]
 thiserror = "1.0"
-address = { package = "forest_address", version = "0.3" }
-crypto = { package = "forest_crypto", version = "0.5", features = ["json", "blst"] }
-bls-signatures = { version = "0.11", default-features = false, features = ["blst"] }
+forest_crypto = { version = "0.5", features = ["blst"] }
+bls-signatures = { version = "0.11", default-features = false, features = [
+    "blst",
+] }
 libsecp256k1 = "0.7"
 rand = "0.8"
-encoding = { package = "forest_encoding", version = "0.2" }
+forest_encoding = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_ipld_dagcbor = "0.1"
 base64 = { version = "0.13" }
@@ -22,6 +23,4 @@ serde_json = "1.0"
 log = "0.4"
 sodiumoxide = "0.2"
 utils = { path = "../node/utils" }
-
-[features]
-json = ["crypto/json"]
+fvm_shared = { version = "0.8", default-features = false }

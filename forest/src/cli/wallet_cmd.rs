@@ -1,24 +1,19 @@
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
+use forest_crypto::signature::json::{signature_type::SignatureTypeJson, SignatureJson};
+use forest_json::address::json::AddressJson;
+use fvm_shared::address::Address;
+use fvm_shared::crypto::signature::{Signature, SignatureType};
+use key_management::json::KeyInfoJson;
 use rpassword::read_password;
+use rpc_client::wallet_ops::*;
 use std::{
     path::PathBuf,
     str::{self, FromStr},
 };
 use structopt::StructOpt;
-
-use address::{json::AddressJson, Address};
-use forest_crypto::{
-    signature::{
-        json::{signature_type::SignatureTypeJson, SignatureJson},
-        SignatureType,
-    },
-    Signature,
-};
-use rpc_client::wallet_ops::*;
 use utils::read_file_to_string;
-use wallet::json::KeyInfoJson;
 
 use super::{cli_error_and_die, handle_rpc_err};
 
@@ -132,9 +127,7 @@ impl WalletCommands {
                 let key = match path {
                     Some(path) => match read_file_to_string(&PathBuf::from(path)) {
                         Ok(key) => key,
-                        _ => {
-                            return cli_error_and_die(&format!("{} is not a valid path", path), 1);
-                        }
+                        _ => cli_error_and_die(&format!("{} is not a valid path", path), 1),
                     },
                     _ => {
                         println!("Enter the private key: ");
@@ -219,12 +212,7 @@ impl WalletCommands {
                 let signature = match address.chars().nth(1).unwrap() {
                     '1' => Signature::new_secp256k1(sig_bytes),
                     '3' => Signature::new_bls(sig_bytes),
-                    _ => {
-                        return cli_error_and_die(
-                            "Invalid signature (must be bls or secp256k1)",
-                            1,
-                        );
-                    }
+                    _ => cli_error_and_die("Invalid signature (must be bls or secp256k1)", 1),
                 };
 
                 let response = wallet_verify((

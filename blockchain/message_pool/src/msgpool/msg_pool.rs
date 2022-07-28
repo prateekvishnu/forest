@@ -10,41 +10,41 @@ use crate::config::MpoolConfig;
 use crate::errors::Error;
 use crate::head_change;
 use crate::msgpool::recover_sig;
-use crate::msgpool::republish_pending_messages;
 use crate::msgpool::BASE_FEE_LOWER_BOUND_FACTOR_CONSERVATIVE;
-use crate::msgpool::REPUBLISH_INTERVAL;
+use crate::msgpool::PROPAGATION_DELAY_SECS;
+use crate::msgpool::{republish_pending_messages, select_messages_for_block};
 use crate::msgpool::{RBF_DENOM, RBF_NUM};
 use crate::provider::Provider;
 use crate::utils::get_base_fee_lower_bound;
-use address::{Address, Protocol};
 use async_std::channel::{bounded, Sender};
 use async_std::stream::interval;
 use async_std::sync::{Arc, RwLock};
 use async_std::task;
-use blocks::{BlockHeader, Tipset, TipsetKeys};
 use chain::{HeadChange, MINIMUM_BASE_FEE};
 use cid::Cid;
-use crypto::{Signature, SignatureType};
-use db::Store;
-use encoding::Cbor;
+use forest_blocks::{BlockHeader, Tipset, TipsetKeys};
+use forest_db::Store;
 use forest_libp2p::{NetworkMessage, Topic, PUBSUB_MSG_STR};
+use forest_message::message::valid_for_block_inclusion;
+use forest_message::{ChainMessage, Message, SignedMessage};
 use futures::{future::select, StreamExt};
+use fvm::gas::{price_list_by_network_version, Gas};
+use fvm_ipld_encoding::Cbor;
+use fvm_shared::address::{Address, Protocol};
+use fvm_shared::bigint::{BigInt, Integer};
+use fvm_shared::crypto::signature::{Signature, SignatureType};
 use log::warn;
 use lru::LruCache;
-use message::{ChainMessage, Message, SignedMessage};
-use networks::NEWEST_NETWORK_VERSION;
-use num_bigint::BigInt;
-use num_bigint::Integer;
+use networks::{ChainConfig, NEWEST_NETWORK_VERSION};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
-use types::verifier::ProofVerifier;
 
 // LruCache sizes have been taken from the lotus implementation
 const BLS_SIG_CACHE_SIZE: usize = 40000;
 const SIG_VAL_CACHE_SIZE: usize = 32000;
 
-/// Simple struct that contains a hashmap of messages where k: a message from address, v: a message
+/// Simple structure that contains a hash-map of messages where k: a message from address, v: a message
 /// which corresponds to that address.
 #[derive(Clone, Default, Debug)]
 pub struct MsgSet {
@@ -54,7 +54,7 @@ pub struct MsgSet {
 }
 
 impl MsgSet {
-    /// Generate a new MsgSet with an empty hashmap and setting the sequence specifically.
+    /// Generate a new `MsgSet` with an empty hash-map and setting the sequence specifically.
     pub fn new(sequence: u64) -> Self {
         MsgSet {
             msgs: HashMap::new(),
@@ -63,7 +63,7 @@ impl MsgSet {
         }
     }
 
-    /// Add a signed message to the MsgSet. Increase next_sequence if the message has a
+    /// Add a signed message to the `MsgSet`. Increase `next_sequence` if the message has a
     /// sequence greater than any existing message sequence.
     pub fn add(&mut self, m: SignedMessage) -> Result<(), Error> {
         if self.msgs.is_empty() || m.sequence() >= self.next_sequence {
@@ -71,10 +71,10 @@ impl MsgSet {
         }
         if let Some(exms) = self.msgs.get(&m.sequence()) {
             if m.cid()? != exms.cid()? {
-                let premium = exms.message().gas_premium();
+                let premium = exms.message().gas_premium.clone();
                 let rbf_denom = BigInt::from(RBF_DENOM);
-                let min_price = premium + ((premium * RBF_NUM).div_floor(&rbf_denom)) + 1u8;
-                if m.message().gas_premium() <= &min_price {
+                let min_price = premium.clone() + ((premium * RBF_NUM).div_floor(&rbf_denom)) + 1u8;
+                if m.message().gas_premium <= min_price {
                     return Err(Error::GasPriceTooLow);
                 }
             } else {
@@ -140,7 +140,7 @@ pub struct MessagePool<T> {
     pub min_gas_price: BigInt,
     /// This is max number of messages in the pool.
     pub max_tx_pool_size: i64,
-    /// TODO
+    // TODO
     pub network_name: String,
     /// Sender half to send messages to other components
     pub network_sender: Sender<NetworkMessage>,
@@ -152,22 +152,25 @@ pub struct MessagePool<T> {
     pub republished: Arc<RwLock<HashSet<Cid>>>,
     /// Acts as a signal to republish messages from the republished set of messages
     pub repub_trigger: Sender<()>,
-    /// TODO look into adding a cap to local_msgs
+    // TODO look into adding a cap to `local_msgs`
     local_msgs: Arc<RwLock<HashSet<SignedMessage>>>,
     /// Configurable parameters of the message pool
     pub config: MpoolConfig,
+    /// Chain configuration
+    pub chain_config: Arc<ChainConfig>,
 }
 
 impl<T> MessagePool<T>
 where
     T: Provider + std::marker::Send + std::marker::Sync + 'static,
 {
-    /// Creates a new MessagePool instance.
+    /// Creates a new `MessagePool` instance.
     pub async fn new(
         mut api: T,
         network_name: String,
         network_sender: Sender<NetworkMessage>,
         config: MpoolConfig,
+        chain_config: Arc<ChainConfig>,
     ) -> Result<MessagePool<T>, Error>
     where
         T: Provider,
@@ -182,6 +185,7 @@ where
         let api_mutex = Arc::new(RwLock::new(api));
         let local_msgs = Arc::new(RwLock::new(HashSet::new()));
         let republished = Arc::new(RwLock::new(HashSet::new()));
+        let block_delay = chain_config.block_delay_secs;
 
         let (repub_trigger, mut repub_trigger_rx) = bounded::<()>(4);
         let mut mp = MessagePool {
@@ -199,6 +203,7 @@ where
             config,
             network_sender,
             repub_trigger,
+            chain_config: Arc::clone(&chain_config),
         };
 
         mp.load_local().await?;
@@ -261,9 +266,10 @@ where
         let local_addrs = mp.local_addrs.clone();
         let network_sender = Arc::new(mp.network_sender.clone());
         let network_name = mp.network_name.clone();
+        let republish_interval = 10 * block_delay + PROPAGATION_DELAY_SECS;
         // Reacts to republishing requests
         task::spawn(async move {
-            let mut interval = interval(Duration::from_millis(REPUBLISH_INTERVAL));
+            let mut interval = interval(Duration::from_millis(republish_interval));
             loop {
                 select(interval.next(), repub_trigger_rx.next()).await;
                 if let Err(e) = republish_pending_messages(
@@ -274,6 +280,7 @@ where
                     cur_tipset.as_ref(),
                     republished.as_ref(),
                     local_addrs.as_ref(),
+                    &chain_config,
                 )
                 .await
                 {
@@ -291,7 +298,7 @@ where
         Ok(())
     }
 
-    /// Push a signed message to the MessagePool. Additionally performs
+    /// Push a signed message to the `MessagePool`. Additionally performs
     pub async fn push(&self, msg: SignedMessage) -> Result<Cid, Error> {
         self.check_message(&msg).await?;
         let cid = msg.cid().map_err(|err| Error::Other(err.to_string()))?;
@@ -316,10 +323,8 @@ where
         if msg.marshal_cbor()?.len() > 32 * 1024 {
             return Err(Error::MessageTooBig);
         }
-        msg.message()
-            .valid_for_block_inclusion(0, NEWEST_NETWORK_VERSION)
-            .map_err(Error::Other)?;
-        if msg.value() > &types::TOTAL_FILECOIN {
+        valid_for_block_inclusion(msg.message(), Gas::new(0), NEWEST_NETWORK_VERSION)?;
+        if msg.value() > &fil_types::TOTAL_FILECOIN {
             return Err(Error::MessageValueTooHigh);
         }
         if msg.gas_fee_cap() < &MINIMUM_BASE_FEE {
@@ -329,7 +334,7 @@ where
     }
 
     /// This is a helper to push that will help to make sure that the message fits the parameters
-    /// to be pushed to the MessagePool.
+    /// to be pushed to the `MessagePool`.
     pub async fn add(&self, msg: SignedMessage) -> Result<(), Error> {
         self.check_message(&msg).await?;
 
@@ -339,7 +344,7 @@ where
         Ok(())
     }
 
-    /// Add a SignedMessage without doing any of the checks.
+    /// Add a `SignedMessage` without doing any of the checks.
     pub async fn add_skip_checks(&mut self, m: SignedMessage) -> Result<(), Error> {
         self.add_helper(m).await
     }
@@ -360,8 +365,8 @@ where
         Ok(())
     }
 
-    /// Verify the state_sequence and balance for the sender of the message given then
-    /// call add_locked to finish adding the signed_message to pending.
+    /// Verify the `state_sequence` and balance for the sender of the message given then
+    /// call `add_locked` to finish adding the `signed_message` to pending.
     async fn add_tipset(
         &self,
         msg: SignedMessage,
@@ -370,15 +375,15 @@ where
     ) -> Result<bool, Error> {
         let sequence = self.get_state_sequence(msg.from(), cur_ts).await?;
 
-        if sequence > msg.message().sequence() {
+        if sequence > msg.message().sequence {
             return Err(Error::SequenceTooLow);
         }
 
-        let publish = verify_msg_before_add(&msg, cur_ts, local)?;
+        let publish = verify_msg_before_add(&msg, cur_ts, local, &self.chain_config)?;
 
         let balance = self.get_state_balance(msg.from(), cur_ts).await?;
 
-        let msg_balance = msg.message().required_funds();
+        let msg_balance = msg.required_funds();
         if balance < msg_balance {
             return Err(Error::NotEnoughFunds);
         }
@@ -386,9 +391,9 @@ where
         Ok(publish)
     }
 
-    /// Finish verifying signed message before adding it to the pending mset hashmap. If an entry
-    /// in the hashmap does not yet exist, create a new mset that will correspond to the from
-    /// message and push it to the pending hashmap.
+    /// Finish verifying signed message before adding it to the pending `mset` hash-map. If an entry
+    /// in the hash-map does not yet exist, create a new `mset` that will correspond to the from
+    /// message and push it to the pending hash-map.
     async fn add_helper(&self, msg: SignedMessage) -> Result<(), Error> {
         let from = *msg.from();
         let cur_ts = self.cur_tipset.read().await.clone();
@@ -423,7 +428,7 @@ where
         }
     }
 
-    /// Get the state of the sequence for a given address in cur_ts.
+    /// Get the state of the sequence for a given address in `cur_ts`.
     async fn get_state_sequence(&self, addr: &Address, cur_ts: &Tipset) -> Result<u64, Error> {
         let actor = self.api.read().await.get_actor_after(addr, cur_ts)?;
         Ok(actor.sequence)
@@ -437,17 +442,16 @@ where
     }
 
     /// Adds a local message returned from the call back function with the current nonce.
-    pub async fn push_with_sequence<V>(&self, addr: &Address, cb: T) -> Result<SignedMessage, Error>
+    pub async fn push_with_sequence(&self, addr: &Address, cb: T) -> Result<SignedMessage, Error>
     where
         T: Fn(Address, u64) -> Result<SignedMessage, Error>,
-        V: ProofVerifier,
     {
         let cur_ts = self.cur_tipset.read().await.clone();
         let from_key = match addr.protocol() {
             Protocol::ID => {
                 let api = self.api.read().await;
 
-                api.state_account_key::<V>(addr, &self.cur_tipset.read().await.clone())
+                api.state_account_key(addr, &self.cur_tipset.read().await.clone())
                     .await?
             }
             _ => *addr,
@@ -464,7 +468,7 @@ where
             return Err(Error::TryAgain);
         }
 
-        let publish = verify_msg_before_add(&msg, &cur_ts, true)?;
+        let publish = verify_msg_before_add(&msg, &cur_ts, true, &self.chain_config)?;
         self.check_balance(&msg, &cur_ts).await?;
         self.add_helper(msg.clone()).await?;
         self.add_local(msg.clone()).await?;
@@ -500,7 +504,7 @@ where
         Ok(())
     }
 
-    /// Remove a message given a sequence and address from the messagepool.
+    /// Remove a message given a sequence and address from the message pool.
     pub async fn remove(
         &mut self,
         from: &Address,
@@ -532,7 +536,7 @@ where
     }
 
     /// Return a Vector of signed messages for a given from address. This vector will be sorted by
-    /// each messsage's sequence. If no corresponding messages found, return None result type.
+    /// each `messsage`'s sequence. If no corresponding messages found, return None result type.
     pub async fn pending_for(&self, a: &Address) -> Option<Vec<SignedMessage>> {
         let pending = self.pending.read().await;
         let mset = pending.get(a)?;
@@ -543,7 +547,7 @@ where
         for (_, item) in mset.msgs.iter() {
             msg_vec.push(item.clone());
         }
-        msg_vec.sort_by_key(|value| value.message().sequence());
+        msg_vec.sort_by_key(|value| value.message().sequence);
         Some(msg_vec)
     }
 
@@ -630,13 +634,37 @@ where
         self.config = cfg;
         Ok(())
     }
+
+    /// Select messages that can be included in a block built on a given base tipset.
+    pub async fn select_messages_for_block(
+        &self,
+        base: &Tipset,
+    ) -> Result<Vec<SignedMessage>, Error> {
+        // Take a snapshot of the pending messages.
+        let pending: HashMap<Address, HashMap<u64, SignedMessage>> = {
+            let pending = self.pending.read().await;
+            pending
+                .iter()
+                .filter_map(|(actor, mset)| {
+                    if mset.msgs.is_empty() {
+                        None
+                    } else {
+                        Some((*actor, mset.msgs.clone()))
+                    }
+                })
+                .collect()
+        };
+
+        select_messages_for_block(self.api.as_ref(), self.chain_config.as_ref(), base, pending)
+            .await
+    }
 }
 
 // Helpers for MessagePool
 
-/// Finish verifying signed message before adding it to the pending mset hashmap. If an entry
-/// in the hashmap does not yet exist, create a new mset that will correspond to the from message
-/// and push it to the pending hashmap.
+/// Finish verifying signed message before adding it to the pending `mset` hash-map. If an entry
+/// in the hash-map does not yet exist, create a new `mset` that will correspond to the from message
+/// and push it to the pending hash-map.
 pub(crate) async fn add_helper<T>(
     api: &RwLock<T>,
     bls_sig_cache: &RwLock<LruCache<Cid, Signature>>,
@@ -654,7 +682,7 @@ where
             .put(msg.cid()?, msg.signature().clone());
     }
 
-    if msg.message().gas_limit() > 100_000_000 {
+    if msg.message().gas_limit > 100_000_000 {
         return Err(Error::Other(
             "given message has too high of a gas limit".to_string(),
         ));
@@ -668,12 +696,12 @@ where
         .put_message(&ChainMessage::Unsigned(msg.message().clone()))?;
 
     let mut pending = pending.write().await;
-    let msett = pending.get_mut(msg.message().from());
+    let msett = pending.get_mut(&msg.message().from);
     match msett {
         Some(mset) => mset.add(msg)?,
         None => {
             let mut mset = MsgSet::new(sequence);
-            let from = *msg.message().from();
+            let from = msg.message().from;
             mset.add(msg)?;
             pending.insert(from, mset);
         }
@@ -682,12 +710,16 @@ where
     Ok(())
 }
 
-fn verify_msg_before_add(m: &SignedMessage, cur_ts: &Tipset, local: bool) -> Result<bool, Error> {
+fn verify_msg_before_add(
+    m: &SignedMessage,
+    cur_ts: &Tipset,
+    local: bool,
+    chain_config: &ChainConfig,
+) -> Result<bool, Error> {
     let epoch = cur_ts.epoch();
-    let min_gas = interpreter::price_list_by_epoch(epoch).on_chain_message(m.marshal_cbor()?.len());
-    m.message()
-        .valid_for_block_inclusion(min_gas.total(), NEWEST_NETWORK_VERSION)
-        .map_err(Error::Other)?;
+    let min_gas = price_list_by_network_version(chain_config.network_version(epoch))
+        .on_chain_message(m.marshal_cbor()?.len());
+    valid_for_block_inclusion(m.message(), min_gas.total(), NEWEST_NETWORK_VERSION)?;
     if !cur_ts.blocks().is_empty() {
         let base_fee = cur_ts.blocks()[0].parent_base_fee();
         let base_fee_lower_bound =
@@ -698,7 +730,7 @@ fn verify_msg_before_add(m: &SignedMessage, cur_ts: &Tipset, local: bool) -> Res
                 return Ok(false);
             } else {
                 return Err(Error::SoftValidationFailure(format!("GasFeeCap doesn't meet base fee lower bound for inclusion in the next 20 blocks (GasFeeCap: {}, baseFeeLowerBound:{})",
-					m.gas_fee_cap(), base_fee_lower_bound)));
+                    m.gas_fee_cap(), base_fee_lower_bound)));
             }
         }
     }

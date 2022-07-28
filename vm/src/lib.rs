@@ -1,9 +1,6 @@
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
-// workaround for a compiler bug, see https://github.com/rust-lang/rust/issues/55779
-extern crate serde;
-
 mod actor_state;
 mod deal_id;
 mod error;
@@ -16,19 +13,20 @@ pub use self::error::*;
 pub use self::method::*;
 pub use self::token::*;
 
-pub use fvm_shared::error::ExitCode;
-
 #[macro_use]
 extern crate lazy_static;
-use cid::{Cid, Code::Blake2b256};
-use encoding::to_vec;
+use cid::multihash::Code::Blake2b256;
+use cid::multihash::MultihashDigest;
+use cid::Cid;
+use fvm_ipld_encoding::to_vec;
+use fvm_ipld_encoding::DAG_CBOR;
 
 lazy_static! {
     /// Cbor bytes of an empty array serialized.
     pub static ref EMPTY_ARR_BYTES: Vec<u8> = to_vec::<[(); 0]>(&[]).unwrap();
 
     /// Cid of the empty array Cbor bytes (`EMPTY_ARR_BYTES`).
-    pub static ref EMPTY_ARR_CID: Cid = cid::new_from_cbor(&EMPTY_ARR_BYTES, Blake2b256);
+    pub static ref EMPTY_ARR_CID: Cid = Cid::new_v1(DAG_CBOR, Blake2b256.digest(&EMPTY_ARR_BYTES));
 }
 
 #[cfg(test)]

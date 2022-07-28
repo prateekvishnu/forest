@@ -1,17 +1,14 @@
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
-use crate::{
-    PoStProof, Randomness, RegisteredPoStProof, RegisteredSealProof, SectorInfo, SectorNumber,
-};
-use cid::Cid;
+use crate::Randomness;
 
 /// Randomness type used for generating PoSt proof randomness.
 pub type PoStRandomness = Randomness;
 
-#[cfg(feature = "json")]
 pub mod json {
-    use super::*;
+    use crate::{PoStProof, RegisteredPoStProof, RegisteredSealProof, SectorInfo, SectorNumber};
+    use cid::Cid;
     use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
     /// Wrapper for serializing a PoStProof to JSON.
@@ -30,7 +27,7 @@ pub mod json {
         #[serde(rename = "SealProof")]
         pub proof: RegisteredSealProof,
         pub sector_number: SectorNumber,
-        #[serde(with = "cid::json")]
+        #[serde(with = "forest_json::cid")]
         #[serde(rename = "SealedCID")]
         pub sealed_cid: Cid,
     }

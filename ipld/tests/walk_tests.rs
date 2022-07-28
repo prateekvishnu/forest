@@ -1,15 +1,14 @@
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
-#![cfg(feature = "submodule_tests")]
-
 use async_trait::async_trait;
-use cid::{Cid, Code::Blake2b256};
-use db::MemoryDB;
+use cid::{multihash::Code::Blake2b256, Cid};
+use forest_db::MemoryDB;
 use forest_ipld::json::{self, IpldJson};
 use forest_ipld::selector::{LastBlockInfo, LinkResolver, Selector, VisitReason};
-use forest_ipld::{Ipld, Path};
-use ipld_blockstore::BlockStore;
+use ipld_blockstore::BlockStoreExt;
+use libipld::Path;
+use libipld_core::ipld::Ipld;
 use serde::Deserialize;
 use std::fs::File;
 use std::io::BufReader;
@@ -34,7 +33,7 @@ enum IpldValue {
     List,
     #[serde(rename = "map")]
     Map,
-    #[serde(rename = "link", with = "cid::json")]
+    #[serde(rename = "link", with = "forest_json::cid")]
     Link(Cid),
 }
 
@@ -75,7 +74,7 @@ mod last_block_json {
         struct LastBlockDe {
             #[serde(with = "super::path_json")]
             path: Path,
-            #[serde(with = "cid::json")]
+            #[serde(with = "forest_json::cid")]
             link: Cid,
         }
         match Deserialize::deserialize(deserializer)? {
@@ -124,7 +123,7 @@ struct TestLinkResolver(MemoryDB);
 #[async_trait]
 impl LinkResolver for TestLinkResolver {
     async fn load_link(&mut self, link: &Cid) -> Result<Option<Ipld>, String> {
-        self.0.get(link).map_err(|e| e.to_string())
+        self.0.get_obj(link).map_err(|e| e.to_string())
     }
 }
 
@@ -133,7 +132,7 @@ async fn process_vector(tv: TestVector) -> Result<(), String> {
     let resolver = tv.cbor_ipld_storage.map(|ipld_storage| {
         let storage = MemoryDB::default();
         for IpldJson(i) in ipld_storage {
-            storage.put(&i, Blake2b256).unwrap();
+            storage.put_obj(&i, Blake2b256).unwrap();
         }
         TestLinkResolver(storage)
     });

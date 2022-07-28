@@ -1,18 +1,15 @@
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
-use vm::ExitCode;
-
-use fvm_shared::encoding::RawBytes;
 use fvm_shared::receipt::Receipt;
 
 /// Result of a state transition from a message
 pub type MessageReceipt = Receipt;
 
-#[cfg(feature = "json")]
 pub mod json {
     use super::*;
-    use num_traits::cast::FromPrimitive;
+    use fvm_ipld_encoding::RawBytes;
+    use fvm_shared::error::ExitCode;
     use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
     /// Wrapper for serializing and deserializing a SignedMessage from JSON.
@@ -51,7 +48,7 @@ pub mod json {
         S: Serializer,
     {
         JsonHelper {
-            exit_code: m.exit_code as u64,
+            exit_code: m.exit_code.value() as u64,
             return_data: base64::encode(m.return_data.bytes()),
             gas_used: m.gas_used,
         }
@@ -68,9 +65,7 @@ pub mod json {
             gas_used,
         } = Deserialize::deserialize(deserializer)?;
         Ok(MessageReceipt {
-            exit_code: ExitCode::from_u64(exit_code).ok_or_else(|| {
-                de::Error::custom("MessageReceipt deserialization: Could not turn u64 to ExitCode")
-            })?,
+            exit_code: ExitCode::new(exit_code as u32),
             return_data: RawBytes::new(base64::decode(&return_data).map_err(de::Error::custom)?),
             gas_used,
         })

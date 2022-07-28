@@ -1,39 +1,43 @@
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
+use actor_interface::market::{DealProposal, DealState};
 use async_std::channel::Sender;
 use async_std::sync::{Arc, RwLock};
 use beacon::BeaconEntry;
-use fil_types::SectorSize;
-use jsonrpc_v2::{MapRouter as JsonRpcMapRouter, Server as JsonRpcServer};
-use serde::{Deserialize, Serialize};
-
-use actor::market::{DealProposal, DealState};
-use address::{json::AddressJson, Address};
 use beacon::{json::BeaconEntryJson, Beacon, BeaconSchedule};
-use bitfield::json::BitFieldJson;
-use blocks::{
+use chain::{headchange_json::SubscriptionHeadChange, ChainStore};
+use chain_sync::{BadBlockCache, SyncState};
+use cid::Cid;
+use fil_types::SectorSize;
+use fil_types::{json::SectorInfoJson, sector::post::json::PoStProofJson};
+use forest_blocks::{
     election_proof::json::ElectionProofJson, ticket::json::TicketJson,
     tipset_keys_json::TipsetKeysJson, Tipset,
 };
-use blockstore::BlockStore;
-use chain::{headchange_json::SubscriptionHeadChange, ChainStore};
-use chain_sync::{BadBlockCache, SyncState};
-use cid::{json::CidJson, Cid};
-use clock::ChainEpoch;
-use fil_types::{json::SectorInfoJson, sector::post::json::PoStProofJson};
+use forest_ipld::json::IpldJson;
+use forest_json::address::json::AddressJson;
+use forest_json::bigint::json;
+use forest_json::cid::CidJson;
 pub use forest_libp2p::{Multiaddr, Protocol};
 use forest_libp2p::{Multihash, NetworkMessage};
-use ipld::json::IpldJson;
-use message::{
+use forest_message::{
     message_receipt::json::MessageReceiptJson, signed_message,
-    signed_message::json::SignedMessageJson, unsigned_message, SignedMessage, UnsignedMessage,
+    signed_message::json::SignedMessageJson, SignedMessage,
 };
+use forest_vm::TokenAmount;
+use fvm::state_tree::ActorState;
+use fvm_ipld_bitfield::json::BitFieldJson;
+use fvm_shared::address::Address;
+use fvm_shared::bigint::BigInt;
+use fvm_shared::clock::ChainEpoch;
+use fvm_shared::message::Message;
+use ipld_blockstore::BlockStore;
+use jsonrpc_v2::{MapRouter as JsonRpcMapRouter, Server as JsonRpcServer};
+use key_management::KeyStore;
 use message_pool::{MessagePool, MpoolRpcProvider};
-use num_bigint::{bigint_ser, BigInt};
+use serde::{Deserialize, Serialize};
 use state_manager::{MiningBaseInfo, StateManager};
-use vm::{ActorState, TokenAmount};
-use wallet::KeyStore;
 
 // RPC State
 #[derive(Serialize)]
@@ -72,18 +76,18 @@ pub type JsonRpcServerState = Arc<JsonRpcServer<JsonRpcMapRouter>>;
 // Chain API
 #[derive(Serialize, Deserialize)]
 pub struct BlockMessages {
-    #[serde(rename = "BlsMessages", with = "unsigned_message::json::vec")]
-    pub bls_msg: Vec<UnsignedMessage>,
+    #[serde(rename = "BlsMessages", with = "forest_message::message::json::vec")]
+    pub bls_msg: Vec<Message>,
     #[serde(rename = "SecpkMessages", with = "signed_message::json::vec")]
     pub secp_msg: Vec<SignedMessage>,
-    #[serde(rename = "Cids", with = "cid::json::vec")]
+    #[serde(rename = "Cids", with = "forest_json::cid::vec")]
     pub cids: Vec<Cid>,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct MessageSendSpec {
-    #[serde(with = "bigint_ser::json")]
+    #[serde(with = "json")]
     max_fee: TokenAmount,
 }
 
@@ -114,12 +118,12 @@ pub struct Partition {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ActorStateJson {
-    #[serde(with = "cid::json")]
+    #[serde(with = "forest_json::cid")]
     code: Cid,
-    #[serde(with = "cid::json")]
+    #[serde(with = "forest_json::cid")]
     head: Cid,
     nonce: u64,
-    #[serde(with = "bigint_ser::json")]
+    #[serde(with = "json")]
     balance: BigInt,
 }
 
@@ -186,12 +190,12 @@ pub struct BlockTemplate {
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct MiningBaseInfoJson {
-    #[serde(with = "bigint_ser::json::opt")]
+    #[serde(with = "json::option")]
     pub miner_power: Option<BigInt>,
-    #[serde(with = "bigint_ser::json::opt")]
+    #[serde(with = "json::option")]
     pub network_power: Option<BigInt>,
     pub sectors: Vec<SectorInfoJson>,
-    #[serde(with = "address::json")]
+    #[serde(with = "forest_json::address::json")]
     pub worker_key: Address,
     pub sector_size: SectorSize,
     #[serde(with = "beacon::json")]

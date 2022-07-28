@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0, MIT
 
 use crate::signature::verify_bls_sig;
-use address::Address;
-use encoding::{blake2b_256, serde_byte_array};
+use forest_encoding::{blake2b_256, serde_byte_array};
+use fvm_shared::address::Address;
 use serde::{Deserialize, Serialize};
 
 /// The output from running a VRF proof.
@@ -33,7 +33,6 @@ pub fn verify_vrf(worker: &Address, vrf_base: &[u8], vrf_proof: &[u8]) -> Result
     verify_bls_sig(vrf_proof, vrf_base, worker).map_err(|e| format!("VRF was invalid: {}", e))
 }
 
-#[cfg(feature = "json")]
 pub mod json {
     use super::*;
     use serde::{de, Deserialize, Deserializer, Serialize, Serializer};

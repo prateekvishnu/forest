@@ -15,14 +15,16 @@ mod state_api;
 mod sync_api;
 mod wallet_api;
 
+use async_std::net::TcpListener;
 use async_std::sync::Arc;
+use chain::Scale;
 use jsonrpc_v2::{Data, Error as JSONRPCError, Server};
 use log::info;
 use tide_websockets::WebSocket;
 
 use beacon::Beacon;
-use blockstore::BlockStore;
 use fil_types::verifier::ProofVerifier;
+use ipld_blockstore::BlockStore;
 use rpc_api::data_types::RPCState;
 
 use crate::rpc_http_handler::rpc_http_handler;
@@ -34,14 +36,15 @@ use rpc_api::{
     state_api::*, sync_api::*, wallet_api::*,
 };
 
-pub async fn start_rpc<DB, B, V>(
+pub async fn start_rpc<DB, B, V, S>(
     state: Arc<RPCState<DB, B>>,
-    rpc_endpoint: &str,
+    rpc_endpoint: TcpListener,
 ) -> Result<(), JSONRPCError>
 where
     DB: BlockStore + Send + Sync + 'static,
     B: Beacon + Send + Sync + 'static,
     V: ProofVerifier + Send + Sync + 'static,
+    S: Scale + 'static,
 {
     use auth_api::*;
     use chain_api::*;
@@ -50,6 +53,7 @@ where
     use sync_api::*;
     use wallet_api::*;
 
+    let block_delay = state.state_manager.chain_config().block_delay_secs;
     let rpc_server = Arc::new(
         Server::new()
             .with_data(Data(state))
@@ -60,6 +64,7 @@ where
             .with_method(BEACON_GET_ENTRY, beacon_get_entry::<DB, B>)
             // Chain API
             .with_method(CHAIN_GET_MESSAGE, chain_api::chain_get_message::<DB, B>)
+            .with_method(CHAIN_EXPORT, chain_api::chain_export::<DB, B>)
             .with_method(CHAIN_READ_OBJ, chain_read_obj::<DB, B>)
             .with_method(CHAIN_HAS_OBJ, chain_has_obj::<DB, B>)
             .with_method(CHAIN_GET_BLOCK_MESSAGES, chain_get_block_messages::<DB, B>)
@@ -88,7 +93,7 @@ where
             .with_method(MPOOL_GET_NONCE, mpool_get_sequence::<DB, B>)
             .with_method(MPOOL_PENDING, mpool_pending::<DB, B>)
             .with_method(MPOOL_PUSH, mpool_push::<DB, B>)
-            .with_method(MPOOL_PUSH_MESSAGE, mpool_push_message::<DB, B, V>)
+            .with_method(MPOOL_PUSH_MESSAGE, mpool_push_message::<DB, B>)
             .with_method(MPOOL_SELECT, mpool_select::<DB, B>)
             // Sync API
             .with_method(SYNC_CHECK_BAD, sync_check_bad::<DB, B>)
@@ -129,39 +134,36 @@ where
             .with_method(STATE_NETWORK_NAME, state_network_name::<DB, B>)
             .with_method(STATE_NETWORK_VERSION, state_get_network_version::<DB, B>)
             .with_method(STATE_REPLAY, state_replay::<DB, B>)
-            .with_method(STATE_GET_ACTOR, state_get_actor::<DB, B, V>)
-            .with_method(STATE_LIST_ACTORS, state_list_actors::<DB, B, V>)
-            .with_method(STATE_ACCOUNT_KEY, state_account_key::<DB, B, V>)
-            .with_method(STATE_LOOKUP_ID, state_lookup_id::<DB, B, V>)
+            .with_method(STATE_GET_ACTOR, state_get_actor::<DB, B>)
+            .with_method(STATE_LIST_ACTORS, state_list_actors::<DB, B>)
+            .with_method(STATE_ACCOUNT_KEY, state_account_key::<DB, B>)
+            .with_method(STATE_LOOKUP_ID, state_lookup_id::<DB, B>)
             .with_method(STATE_MARKET_BALANCE, state_market_balance::<DB, B>)
             .with_method(STATE_MARKET_DEALS, state_market_deals::<DB, B>)
             .with_method(STATE_GET_RECEIPT, state_get_receipt::<DB, B>)
             .with_method(STATE_WAIT_MSG, state_wait_msg::<DB, B>)
-            .with_method(MINER_CREATE_BLOCK, miner_create_block::<DB, B, V>)
+            .with_method(MINER_CREATE_BLOCK, miner_create_block::<DB, B, S>)
             .with_method(
                 STATE_MINER_SECTOR_ALLOCATED,
                 state_miner_sector_allocated::<DB, B>,
             )
-            .with_method(STATE_MINER_POWER, state_miner_power::<DB, B, V>)
+            .with_method(STATE_MINER_POWER, state_miner_power::<DB, B>)
             .with_method(
                 STATE_MINER_PRE_COMMIT_DEPOSIT_FOR_POWER,
-                state_miner_pre_commit_deposit_for_power::<DB, B, V>,
+                state_miner_pre_commit_deposit_for_power::<DB, B>,
             )
             .with_method(
                 STATE_MINER_INITIAL_PLEDGE_COLLATERAL,
-                state_miner_initial_pledge_collateral::<DB, B, V>,
+                state_miner_initial_pledge_collateral::<DB, B>,
             )
             .with_method(MINER_GET_BASE_INFO, miner_get_base_info::<DB, B, V>)
             // Gas API
             .with_method(GAS_ESTIMATE_FEE_CAP, gas_estimate_fee_cap::<DB, B>)
-            .with_method(GAS_ESTIMATE_GAS_LIMIT, gas_estimate_gas_limit::<DB, B, V>)
+            .with_method(GAS_ESTIMATE_GAS_LIMIT, gas_estimate_gas_limit::<DB, B>)
             .with_method(GAS_ESTIMATE_GAS_PREMIUM, gas_estimate_gas_premium::<DB, B>)
-            .with_method(
-                GAS_ESTIMATE_MESSAGE_GAS,
-                gas_estimate_message_gas::<DB, B, V>,
-            )
+            .with_method(GAS_ESTIMATE_MESSAGE_GAS, gas_estimate_message_gas::<DB, B>)
             // Common API
-            .with_method(VERSION, version)
+            .with_method(VERSION, move || version(block_delay))
             // Net API
             .with_method(NET_ADDRS_LISTEN, net_api::net_addrs_listen::<DB, B>)
             .with_method(NET_PEERS, net_api::net_peers::<DB, B>)
@@ -177,7 +179,6 @@ where
         .post(rpc_http_handler::<DB, B>);
 
     info!("Ready for RPC connections");
-
     app.listen(rpc_endpoint).await?;
 
     info!("Stopped accepting RPC connections");

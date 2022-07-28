@@ -1,38 +1,40 @@
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
+use chain::Scale;
 use jsonrpc_v2::{Data, Error as JsonRpcError, Params};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use actor::{
+use actor_interface::{
     market,
     miner::{self, MinerPower, SectorOnChainInfo},
     power::{self, Claim},
     reward,
 };
-use address::json::AddressJson;
 use beacon::{Beacon, BeaconEntry};
-use blocks::{
-    election_proof::json::ElectionProofJson, ticket::json::TicketJson,
-    tipset_keys_json::TipsetKeysJson,
-};
-use blocks::{
-    gossip_block::json::GossipBlockJson as BlockMsgJson, BlockHeader, GossipBlock as BlockMsg,
-    Tipset, TxMeta,
-};
-use blockstore::BlockStore;
-use bls_signatures::Serialize as SerializeBls;
-use cid::{json::CidJson, Cid, Code::Blake2b256};
-use crypto::SignatureType;
+use cid::Cid;
 use fil_types::{
     verifier::{FullVerifier, ProofVerifier},
     PoStProof,
 };
-use ipld::{json::IpldJson, Ipld};
-use ipld_amt::Amt;
-use message::{signed_message::SignedMessage, unsigned_message::UnsignedMessage};
-use num_bigint::BigInt;
+use forest_blocks::{
+    election_proof::json::ElectionProofJson, ticket::json::TicketJson,
+    tipset_keys_json::TipsetKeysJson,
+};
+use forest_blocks::{
+    gossip_block::json::GossipBlockJson as BlockMsgJson, BlockHeader, GossipBlock as BlockMsg,
+    Tipset,
+};
+use forest_ipld::json::IpldJson;
+use forest_json::address::json::AddressJson;
+use forest_json::cid::CidJson;
+use forest_message::signed_message::SignedMessage;
+use fvm::state_tree::StateTree;
+use fvm_shared::{address::Address, bigint::BigInt};
+use ipld_blockstore::{BlockStore, BlockStoreExt};
+use libipld_core::ipld::Ipld;
+use networks::Height;
 use rpc_api::{
     data_types::{
         ActorStateJson, Deadline, MarketDeal, MessageLookup, MiningBaseInfoJson, Partition,
@@ -41,7 +43,6 @@ use rpc_api::{
     state_api::*,
 };
 use state_manager::{InvocResult, StateManager};
-use state_tree::StateTree;
 
 // TODO handle using configurable verification implementation in RPC (all defaulting to Full).
 
@@ -78,16 +79,14 @@ pub(crate) async fn state_call<
     Params(params): Params<StateCallParams>,
 ) -> Result<StateCallResult, JsonRpcError> {
     let state_manager = &data.state_manager;
-    let (unsigned_msg_json, key) = params;
-    let mut message: UnsignedMessage = unsigned_msg_json.into();
+    let (message_json, key) = params;
+    let mut message = message_json.into();
     let tipset = data
         .state_manager
         .chain_store()
         .tipset_from_keys(&key.into())
         .await?;
-    Ok(state_manager
-        .call::<FullVerifier>(&mut message, Some(tipset))
-        .await?)
+    Ok(state_manager.call(&mut message, Some(tipset)).await?)
 }
 
 /// returns all the proving deadlines for the given miner
@@ -97,7 +96,7 @@ pub(crate) async fn state_miner_deadlines<
 >(
     data: Data<RPCState<DB, B>>,
     Params(params): Params<StateMinerDeadlinesParams>,
-) -> Result<StateMinerDeadlinesResult, JsonRpcError> {
+) -> anyhow::Result<StateMinerDeadlinesResult, JsonRpcError> {
     let (actor, key) = params;
     let actor = actor.into();
     let mas = data
@@ -107,7 +106,12 @@ pub(crate) async fn state_miner_deadlines<
         .await
         .map_err(|e| format!("Could not load miner {:?}", e))?;
 
-    let mut out = Vec::with_capacity(mas.num_deadlines() as usize);
+    let num_deadlines = data
+        .state_manager
+        .chain_config()
+        .policy
+        .wpost_period_deadlines;
+    let mut out = Vec::with_capacity(num_deadlines as usize);
     mas.for_each_deadline(data.state_manager.blockstore(), |_, dl| {
         out.push(Deadline {
             post_submissions: dl.partitions_posted().clone().into(),
@@ -303,7 +307,7 @@ pub(crate) async fn state_miner_partitions<
 >(
     data: Data<RPCState<DB, B>>,
     Params(params): Params<StateMinerPartitionsParams>,
-) -> Result<StateMinerPartitionsResult, JsonRpcError> {
+) -> anyhow::Result<StateMinerPartitionsResult, JsonRpcError> {
     let (actor, dl_idx, key) = params;
     let actor = actor.into();
     let db = data.state_manager.chain_store().db.as_ref();
@@ -345,12 +349,12 @@ pub(crate) async fn state_replay<
         .chain_store()
         .tipset_from_keys(&key.into())
         .await?;
-    let (msg, ret) = state_manager.replay::<FullVerifier>(&tipset, cid).await?;
+    let (msg, ret) = state_manager.replay(&tipset, cid).await?;
 
     Ok(InvocResult {
         msg,
         msg_rct: Some(ret.msg_receipt),
-        error: ret.act_error.map(|e| e.to_string()),
+        error: ret.failure_info.map(|e| e.to_string()),
     })
 }
 
@@ -389,7 +393,6 @@ pub(crate) async fn state_get_network_version<
 pub(crate) async fn state_get_actor<
     DB: BlockStore + Send + Sync + 'static,
     B: Beacon + Send + Sync + 'static,
-    V: ProofVerifier + Send + Sync + 'static,
 >(
     data: Data<RPCState<DB, B>>,
     Params(params): Params<StateGetActorParams>,
@@ -402,7 +405,7 @@ pub(crate) async fn state_get_actor<
         .chain_store()
         .tipset_from_keys(&key.into())
         .await?;
-    let state = state_for_ts::<DB, V>(state_manager, tipset).await?;
+    let state = state_for_ts(state_manager, tipset).await?;
     Ok(state.get_actor(&actor)?.map(ActorStateJson::from))
 }
 
@@ -410,7 +413,6 @@ pub(crate) async fn state_get_actor<
 pub(crate) async fn state_list_actors<
     DB: BlockStore + Send + Sync + 'static,
     B: Beacon + Send + Sync + 'static,
-    V: ProofVerifier + Send + Sync + 'static,
 >(
     data: Data<RPCState<DB, B>>,
     Params(params): Params<StateListActorsParams>,
@@ -423,7 +425,7 @@ pub(crate) async fn state_list_actors<
         .tipset_from_keys(&tipset.into())
         .await?;
 
-    let addresses = data.state_manager.list_miner_actors::<V>(&tipset)?;
+    let addresses = data.state_manager.list_miner_actors(&tipset)?;
 
     let addresses_json = addresses
         .iter()
@@ -437,7 +439,6 @@ pub(crate) async fn state_list_actors<
 pub(crate) async fn state_account_key<
     DB: BlockStore + Send + Sync + 'static,
     B: Beacon + Send + Sync + 'static,
-    V: ProofVerifier + Send + Sync + 'static,
 >(
     data: Data<RPCState<DB, B>>,
     Params(params): Params<StateAccountKeyParams>,
@@ -450,7 +451,7 @@ pub(crate) async fn state_account_key<
         .chain_store()
         .tipset_from_keys(&key.into())
         .await?;
-    let state = state_for_ts::<DB, V>(state_manager, tipset).await?;
+    let state = state_for_ts(state_manager, tipset).await?;
     let address = interpreter::resolve_to_key_addr(&state, state_manager.blockstore(), &actor)?;
     Ok(Some(address.into()))
 }
@@ -458,7 +459,6 @@ pub(crate) async fn state_account_key<
 pub(crate) async fn state_lookup_id<
     DB: BlockStore + Send + Sync + 'static,
     B: Beacon + Send + Sync + 'static,
-    V: ProofVerifier + Send + Sync + 'static,
 >(
     data: Data<RPCState<DB, B>>,
     Params(params): Params<StateLookupIdParams>,
@@ -471,11 +471,11 @@ pub(crate) async fn state_lookup_id<
         .chain_store()
         .tipset_from_keys(&key.into())
         .await?;
-    let state = state_for_ts::<DB, V>(state_manager, tipset).await?;
+    let state = state_for_ts::<DB>(state_manager, tipset).await?;
     let lookup_result = state.lookup_id(&address)?;
 
     match lookup_result {
-        Some(addr) => Ok(Some(AddressJson(addr))),
+        Some(actor_id) => Ok(Some(AddressJson(Address::new_id(actor_id)))),
         None => Ok(None),
     }
 }
@@ -511,8 +511,8 @@ pub(crate) async fn state_market_deals<
     let ts = data.chain_store.tipset_from_keys(&tsk).await?;
     let actor = data
         .state_manager
-        .get_actor(market::ADDRESS, *ts.parent_state())?
-        .ok_or("Power actor address could not be resolved")?;
+        .get_actor(&market::ADDRESS, *ts.parent_state())?
+        .ok_or("Market actor address could not be resolved")?;
     let market_state = market::State::load(data.state_manager.blockstore(), &actor)?;
 
     let da = market_state.proposals(data.state_manager.blockstore())?;
@@ -591,7 +591,7 @@ pub(crate) async fn state_wait_msg<
 pub(crate) async fn miner_create_block<
     DB: BlockStore + Send + Sync + 'static,
     B: Beacon + Send + Sync + 'static,
-    V: ProofVerifier + Send + Sync + 'static,
+    S: Scale,
 >(
     data: Data<RPCState<DB, B>>,
     Params(params): Params<MinerCreateBlockParams>,
@@ -612,68 +612,24 @@ pub(crate) async fn miner_create_block<
         .collect();
 
     let pts = data.chain_store.tipset_from_keys(&parents).await?;
-    let (st, recpts) = data.state_manager.tipset_state::<V>(&pts).await?;
+    let (st, recpts) = data.state_manager.tipset_state(&pts).await?;
     let (_, lbst) = data
         .state_manager
-        .get_lookback_tipset_for_round::<V>(pts.clone(), epoch)
+        .get_lookback_tipset_for_round(pts.clone(), epoch)
         .await?;
-    let worker = data.state_manager.get_miner_worker_raw(&lbst, &miner)?;
+    let worker = data.state_manager.get_miner_work_addr(lbst, &miner)?;
 
-    let mut bls_msgs = Vec::new();
-    let mut secp_msgs = Vec::new();
-    let mut bls_cids = Vec::new();
-    let mut secp_cids = Vec::new();
+    let persisted =
+        chain::persist_block_messages(data.chain_store.blockstore(), messages.iter().collect())?;
 
-    let mut bls_sigs = Vec::new();
-    for msg in messages {
-        if msg.signature().signature_type() == SignatureType::BLS {
-            let c = data
-                .chain_store
-                .blockstore()
-                .put(&msg.message, Blake2b256)?;
-            bls_sigs.push(msg.signature);
-            bls_msgs.push(msg.message);
-            bls_cids.push(c);
-        } else {
-            let c = data.chain_store.blockstore().put(&msg, Blake2b256)?;
-            secp_cids.push(c);
-            secp_msgs.push(msg);
-        }
-    }
-
-    let bls_msg_root = Amt::new_from_iter(data.chain_store.blockstore(), bls_cids.iter().copied())?;
-    let secp_msg_root =
-        Amt::new_from_iter(data.chain_store.blockstore(), secp_cids.iter().copied())?;
-
-    let mmcid = data.chain_store.blockstore().put(
-        &TxMeta {
-            bls_message_root: bls_msg_root,
-            secp_message_root: secp_msg_root,
-        },
-        Blake2b256,
-    )?;
-
-    let calculated_bls_agg = if bls_sigs.is_empty() {
-        Some(crypto::Signature::new_bls(vec![]))
-    } else {
-        Some(crypto::Signature::new_bls(
-            bls_signatures::aggregate(
-                &bls_sigs
-                    .iter()
-                    .map(|s| s.bytes())
-                    .map(bls_signatures::Signature::from_bytes)
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
-            .unwrap()
-            .as_bytes(),
-        ))
-    };
-    let pweight = chain::weight(data.chain_store.blockstore(), pts.as_ref())?;
-    let base_fee = chain::compute_base_fee(data.chain_store.blockstore(), pts.as_ref())?;
+    let pweight = S::weight(data.chain_store.blockstore(), pts.as_ref())?;
+    let smoke_height = data.state_manager.chain_config().epoch(Height::Smoke);
+    let base_fee =
+        chain::compute_base_fee(data.chain_store.blockstore(), pts.as_ref(), smoke_height)?;
 
     let mut next = BlockHeader::builder()
-        .messages(mmcid)
-        .bls_aggregate(calculated_bls_agg)
+        .messages(persisted.msg_cid)
+        .bls_aggregate(Some(persisted.bls_agg))
         .miner_address(miner)
         .weight(pweight)
         .parent_base_fee(base_fee)
@@ -689,8 +645,8 @@ pub(crate) async fn miner_create_block<
         .signature(None)
         .build()?;
 
-    let key = wallet::find_key(&worker, &*data.keystore.as_ref().write().await)?;
-    let sig = wallet::sign(
+    let key = key_management::find_key(&worker, &*data.keystore.as_ref().read().await)?;
+    let sig = key_management::sign(
         *key.key_info.key_type(),
         key.key_info.private_key(),
         &next.to_signing_bytes(),
@@ -699,8 +655,8 @@ pub(crate) async fn miner_create_block<
 
     Ok(BlockMsgJson(BlockMsg {
         header: next,
-        bls_messages: bls_cids,
-        secpk_messages: secp_cids,
+        bls_messages: persisted.bls_cids,
+        secpk_messages: persisted.secp_cids,
     }))
 }
 
@@ -719,42 +675,48 @@ pub(crate) async fn state_miner_sector_allocated<
         .get_actor(&maddr, *ts.parent_state())?
         .ok_or(format!("Miner actor {} could not be resolved", maddr))?;
     let allocated_sectors = match miner::State::load(data.state_manager.blockstore(), &actor)? {
-        miner::State::V0(m) => data
+        // miner::State::V0(m) => data
+        //     .chain_store
+        //     .db
+        //     .get::<bitfield::BitField>(&m.allocated_sectors)?
+        //     .ok_or("allocated sectors bitfield not found")?
+        //     .get(sector_num as usize),
+        // miner::State::V2(m) => data
+        //     .chain_store
+        //     .db
+        //     .get::<bitfield::BitField>(&m.allocated_sectors)?
+        //     .ok_or("allocated sectors bitfield not found")?
+        //     .get(sector_num as usize),
+        // miner::State::V3(m) => data
+        //     .chain_store
+        //     .db
+        //     .get::<bitfield::BitField>(&m.allocated_sectors)?
+        //     .ok_or("allocated sectors bitfield not found")?
+        //     .get(sector_num as usize),
+        // miner::State::V4(m) => data
+        //     .chain_store
+        //     .db
+        //     .get::<bitfield::BitField>(&m.allocated_sectors)?
+        //     .ok_or("allocated sectors bitfield not found")?
+        //     .get(sector_num as usize),
+        // miner::State::V5(m) => data
+        //     .chain_store
+        //     .db
+        //     .get::<bitfield::BitField>(&m.allocated_sectors)?
+        //     .ok_or("allocated sectors bitfield not found")?
+        //     .get(sector_num as usize),
+        // miner::State::V6(m) => data
+        //     .chain_store
+        //     .db
+        //     .get::<bitfield::BitField>(&m.allocated_sectors)?
+        //     .ok_or("allocated sectors bitfield not found")?
+        //     .get(sector_num as usize),
+        miner::State::V8(m) => data
             .chain_store
             .db
-            .get::<bitfield::BitField>(&m.allocated_sectors)?
+            .get_obj::<fvm_ipld_bitfield::BitField>(&m.allocated_sectors)?
             .ok_or("allocated sectors bitfield not found")?
-            .get(sector_num as usize),
-        miner::State::V2(m) => data
-            .chain_store
-            .db
-            .get::<bitfield::BitField>(&m.allocated_sectors)?
-            .ok_or("allocated sectors bitfield not found")?
-            .get(sector_num as usize),
-        miner::State::V3(m) => data
-            .chain_store
-            .db
-            .get::<bitfield::BitField>(&m.allocated_sectors)?
-            .ok_or("allocated sectors bitfield not found")?
-            .get(sector_num as usize),
-        miner::State::V4(m) => data
-            .chain_store
-            .db
-            .get::<bitfield::BitField>(&m.allocated_sectors)?
-            .ok_or("allocated sectors bitfield not found")?
-            .get(sector_num as usize),
-        miner::State::V5(m) => data
-            .chain_store
-            .db
-            .get::<bitfield::BitField>(&m.allocated_sectors)?
-            .ok_or("allocated sectors bitfield not found")?
-            .get(sector_num as usize),
-        miner::State::V6(m) => data
-            .chain_store
-            .db
-            .get::<bitfield::BitField>(&m.allocated_sectors)?
-            .ok_or("allocated sectors bitfield not found")?
-            .get(sector_num as usize),
+            .get(sector_num),
     };
 
     Ok(allocated_sectors)
@@ -763,7 +725,6 @@ pub(crate) async fn state_miner_sector_allocated<
 pub(crate) async fn state_miner_power<
     DB: BlockStore + Send + Sync + 'static,
     B: Beacon + Send + Sync + 'static,
-    V: ProofVerifier + Send + Sync + 'static,
 >(
     data: Data<RPCState<DB, B>>,
     Params(params): Params<StateMinerPowerParams>,
@@ -802,19 +763,18 @@ pub(crate) async fn state_miner_power<
 pub(crate) async fn state_miner_pre_commit_deposit_for_power<
     DB: BlockStore + Send + Sync + 'static,
     B: Beacon + Send + Sync + 'static,
-    V: ProofVerifier + Send + Sync + 'static,
 >(
     data: Data<RPCState<DB, B>>,
     Params(params): Params<StateMinerPreCommitDepositForPowerParams>,
 ) -> Result<StateMinerPreCommitDepositForPowerResult, JsonRpcError> {
     let (AddressJson(maddr), pci, TipsetKeysJson(tsk)) = params;
     let ts = data.chain_store.tipset_from_keys(&tsk).await?;
-    let (state, _) = data.state_manager.tipset_state::<V>(&ts).await?;
+    let (state, _) = data.state_manager.tipset_state(&ts).await?;
     let state = StateTree::new_from_root(data.chain_store.db.as_ref(), &state)?;
     let ssize = pci.seal_proof.sector_size()?;
 
     let actor = state
-        .get_actor(market::ADDRESS)?
+        .get_actor(&market::ADDRESS)?
         .ok_or("couldnt load market actor")?;
     let (w, vw) = market::State::load(data.state_manager.blockstore(), &actor)?
         .verify_deals_for_activation(
@@ -825,16 +785,16 @@ pub(crate) async fn state_miner_pre_commit_deposit_for_power<
             ts.epoch(),
         )?;
     let duration = pci.expiration - ts.epoch();
-    let sector_weight = actor::actorv2::miner::qa_power_for_weight(ssize, duration, &w, &vw);
+    let sector_weight = fil_actor_miner_v8::qa_power_for_weight(ssize, duration, &w, &vw);
 
     let actor = state
-        .get_actor(power::ADDRESS)?
+        .get_actor(&power::ADDRESS)?
         .ok_or("couldnt load power actor")?;
     let power_smoothed =
         power::State::load(data.state_manager.blockstore(), &actor)?.total_power_smoothed();
 
     let reward_actor = state
-        .get_actor(reward::ADDRESS)?
+        .get_actor(&reward::ADDRESS)?
         .ok_or("couldnt load reward actor")?;
     let deposit = reward::State::load(data.state_manager.blockstore(), &reward_actor)?
         .pre_commit_deposit_for_power(power_smoothed, &sector_weight);
@@ -846,19 +806,18 @@ pub(crate) async fn state_miner_pre_commit_deposit_for_power<
 pub(crate) async fn state_miner_initial_pledge_collateral<
     DB: BlockStore + Send + Sync + 'static,
     B: Beacon + Send + Sync + 'static,
-    V: ProofVerifier + Send + Sync + 'static,
 >(
     data: Data<RPCState<DB, B>>,
     Params(params): Params<StateMinerInitialPledgeCollateralParams>,
 ) -> Result<StateMinerInitialPledgeCollateralResult, JsonRpcError> {
     let (AddressJson(maddr), pci, TipsetKeysJson(tsk)) = params;
     let ts = data.chain_store.tipset_from_keys(&tsk).await?;
-    let (state, _) = data.state_manager.tipset_state::<V>(&ts).await?;
-    let state = StateTree::new_from_root(data.chain_store.db.as_ref(), &state)?;
+    let (root_cid, _) = data.state_manager.tipset_state(&ts).await?;
+    let state = StateTree::new_from_root(data.chain_store.db.as_ref(), &root_cid)?;
     let ssize = pci.seal_proof.sector_size()?;
 
     let actor = state
-        .get_actor(market::ADDRESS)?
+        .get_actor(&market::ADDRESS)?
         .ok_or("couldnt load market actor")?;
     let (w, vw) = market::State::load(data.state_manager.blockstore(), &actor)?
         .verify_deals_for_activation(
@@ -869,10 +828,10 @@ pub(crate) async fn state_miner_initial_pledge_collateral<
             ts.epoch(),
         )?;
     let duration = pci.expiration - ts.epoch();
-    let sector_weight = actor::actorv2::miner::qa_power_for_weight(ssize, duration, &w, &vw);
+    let sector_weight = fil_actor_miner_v8::qa_power_for_weight(ssize, duration, &w, &vw);
 
     let actor = state
-        .get_actor(power::ADDRESS)?
+        .get_actor(&power::ADDRESS)?
         .ok_or("couldnt load power actor")?;
     let power_state = power::State::load(data.state_manager.blockstore(), &actor)?;
     let power_smoothed = power_state.total_power_smoothed();
@@ -883,7 +842,7 @@ pub(crate) async fn state_miner_initial_pledge_collateral<
         .get_circulating_supply(ts.epoch(), &state)?;
 
     let reward_actor = state
-        .get_actor(reward::ADDRESS)?
+        .get_actor(&reward::ADDRESS)?
         .ok_or("couldnt load reward actor")?;
 
     let initial_pledge = reward::State::load(data.state_manager.blockstore(), &reward_actor)?
@@ -913,16 +872,15 @@ pub(crate) async fn miner_get_base_info<
 }
 
 /// returns a state tree given a tipset
-async fn state_for_ts<DB, V>(
+async fn state_for_ts<DB>(
     state_manager: &Arc<StateManager<DB>>,
     ts: Arc<Tipset>,
-) -> Result<StateTree<'_, DB>, JsonRpcError>
+) -> Result<StateTree<&DB>, JsonRpcError>
 where
     DB: BlockStore + Send + Sync + 'static,
-    V: ProofVerifier + Send + Sync + 'static,
 {
     let block_store = state_manager.blockstore();
-    let (st, _) = state_manager.tipset_state::<V>(&ts).await?;
+    let (st, _) = state_manager.tipset_state(&ts).await?;
     let state_tree = StateTree::new_from_root(block_store, &st)?;
     Ok(state_tree)
 }

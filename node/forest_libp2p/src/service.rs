@@ -12,14 +12,14 @@ use crate::{
 use async_std::channel::{unbounded, Receiver, Sender};
 use async_std::{stream, task};
 use chain::ChainStore;
+use cid::{multihash::Code::Blake2b256, Cid};
 use forest_blocks::GossipBlock;
-use forest_cid::{Cid, Code::Blake2b256};
-use forest_encoding::from_slice;
 use forest_message::SignedMessage;
 use futures::channel::oneshot::Sender as OneShotSender;
 use futures::select;
 use futures_util::stream::StreamExt;
-use ipld_blockstore::BlockStore;
+use fvm_ipld_encoding::from_slice;
+use ipld_blockstore::{BlockStore, BlockStoreExt};
 pub use libp2p::gossipsub::IdentTopic;
 pub use libp2p::gossipsub::Topic;
 use libp2p::multiaddr::Protocol;
@@ -283,7 +283,7 @@ where
                                 }
                             }
                         },
-                        SwarmEvent::Behaviour(ForestBehaviourEvent::BitswapReceivedWant(peer_id, cid,)) => match self.cs.blockstore().get(&cid) {
+                        SwarmEvent::Behaviour(ForestBehaviourEvent::BitswapReceivedWant(peer_id, cid,)) => match self.cs.blockstore().get_obj(&cid) {
                             Ok(Some(data)) => {
                                 match swarm_stream.get_mut().behaviour_mut().send_block(&peer_id, cid, data) {
                                     Ok(_) => {

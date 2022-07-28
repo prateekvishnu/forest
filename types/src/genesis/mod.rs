@@ -1,12 +1,13 @@
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
-use address::{json as addr_json, Address};
+use forest_json::address::json as addr_json;
+use forest_json::bigint::json as bigint_json;
+use forest_vm::TokenAmount;
+use fvm_shared::address::Address;
 use fvm_shared::sector::SectorSize;
-use num_bigint::bigint_ser::json as bigint_json;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
-use vm::TokenAmount;
 
 /// Different account variants. This is used with genesis utils to define the possible
 /// genesis allocated actors.

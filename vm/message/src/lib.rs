@@ -1,19 +1,17 @@
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
-// workaround for a compiler bug, see https://github.com/rust-lang/rust/issues/55779
 pub mod chain_message;
+pub mod message;
 pub mod message_receipt;
 pub mod signed_message;
-pub mod unsigned_message;
 
 pub use chain_message::ChainMessage;
 pub use message_receipt::MessageReceipt;
 pub use signed_message::SignedMessage;
-pub use unsigned_message::UnsignedMessage;
 
-use address::Address;
-use vm::{MethodNum, Serialized, TokenAmount};
+use forest_vm::{MethodNum, Serialized, TokenAmount};
+use fvm_shared::address::Address;
 
 /// Message interface to interact with Signed and unsigned messages in a generic context.
 pub trait Message {

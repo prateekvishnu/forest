@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0, MIT
 
 use chain::{ChainStore, Error as ChainError};
+use cid::Cid;
 use forest_blocks::{Tipset, TipsetKeys};
-use forest_cid::Cid;
 use ipld_blockstore::BlockStore;
 use log::debug;
 use std::collections::HashMap;
@@ -152,8 +152,8 @@ mod tests {
     use super::super::{HEADERS, MESSAGES};
     use super::*;
     use async_std::io::BufReader;
-    use db::MemoryDB;
-    use forest_car::load_car;
+    use forest_db::MemoryDB;
+    use fvm_ipld_car::load_car;
     use genesis::EXPORT_SR_40;
     use std::sync::Arc;
 

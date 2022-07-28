@@ -1,12 +1,12 @@
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
-use blocks::Error as BlkErr;
 use cid::Error as CidErr;
-use db::Error as DbErr;
-use encoding::{error::Error as SerdeErr, Error as EncErr};
-use ipld_amt::Error as AmtErr;
-use std::error::Error as StdError;
+use forest_blocks::Error as BlkErr;
+use forest_db::Error as DbErr;
+use forest_encoding::error::Error as SerdeErr;
+use fvm_ipld_encoding::Error as EncErr;
+use legacy_ipld_amt::Error as AmtErr;
 use thiserror::Error;
 
 /// Chain error
@@ -65,8 +65,8 @@ impl From<String> for Error {
     }
 }
 
-impl From<Box<dyn StdError>> for Error {
-    fn from(e: Box<dyn StdError>) -> Self {
+impl From<anyhow::Error> for Error {
+    fn from(e: anyhow::Error) -> Self {
         Error::Other(e.to_string())
     }
 }

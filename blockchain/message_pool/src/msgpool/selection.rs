@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0, MIT
 
 //! Contains routines for message selection APIs.
-//! Whenever a miner is ready to create a block for a tipset, it invokes the select_messages API
+//! Whenever a miner is ready to create a block for a tipset, it invokes the `select_messages` API
 //! which selects an appropriate set of messages such that it optimizes miner reward and chain capacity.
-//! See https://docs.filecoin.io/mine/lotus/message-pool/#message-selection for more details
+//! See <https://docs.filecoin.io/mine/lotus/message-pool/#message-selection> for more details
 
 use super::msg_pool::MessagePool;
 use super::provider::Provider;
@@ -13,12 +13,12 @@ use crate::msg_pool::MsgSet;
 use crate::msgpool::MIN_GAS;
 use crate::Error;
 use crate::{add_to_selected_msgs, remove_from_selected_msgs};
-use address::Address;
 use async_std::sync::{Arc, RwLock};
-use blocks::Tipset;
-use message::Message;
-use message::SignedMessage;
-use num_bigint::BigInt;
+use forest_blocks::Tipset;
+use forest_message::Message;
+use forest_message::SignedMessage;
+use fvm_shared::address::Address;
+use fvm_shared::bigint::BigInt;
 use rand::prelude::SliceRandom;
 use rand::thread_rng;
 use std::borrow::BorrowMut;
@@ -84,7 +84,16 @@ where
         // 1. Create a list of dependent message chains with maximal gas reward per limit consumed
         let mut chains = Chains::new();
         for (actor, mset) in pending.into_iter() {
-            create_message_chains(&self.api, &actor, &mset, &base_fee, ts, &mut chains).await?;
+            create_message_chains(
+                &self.api,
+                &actor,
+                &mset,
+                &base_fee,
+                ts,
+                &mut chains,
+                &self.chain_config,
+            )
+            .await?;
         }
 
         let (msgs, _) = merge_and_trim(&mut chains, result, &base_fee, gas_limit, MIN_GAS);
@@ -131,6 +140,7 @@ where
                 &base_fee,
                 target_tipset,
                 &mut chains,
+                &self.chain_config,
             )
             .await?;
         }
@@ -153,7 +163,7 @@ where
         let mut partitions: Vec<Vec<NodeKey>> = vec![vec![]; MAX_BLOCKS];
         let mut i = 0;
         while i < MAX_BLOCKS && next_chain < chains.len() {
-            let mut gas_limit = types::BLOCK_GAS_LIMIT;
+            let mut gas_limit = fil_types::BLOCK_GAS_LIMIT;
             while next_chain < chains.len() {
                 let chain_key = chains.key_vec[next_chain];
                 next_chain += 1;
@@ -483,7 +493,7 @@ where
         ts: &Tipset,
     ) -> Result<(Vec<SignedMessage>, i64), Error> {
         let result = Vec::with_capacity(self.config.size_limit_low() as usize);
-        let gas_limit = types::BLOCK_GAS_LIMIT;
+        let gas_limit = fil_types::BLOCK_GAS_LIMIT;
         let min_gas = 1298450;
 
         // 1. Get priority actor chains
@@ -493,7 +503,16 @@ where
             // remove actor from pending set as we are processing these messages.
             if let Some(mset) = pending.remove(actor) {
                 // create chains for the priority actor
-                create_message_chains(&self.api, actor, &mset, base_fee, ts, &mut chains).await?;
+                create_message_chains(
+                    &self.api,
+                    actor,
+                    &mset,
+                    base_fee,
+                    ts,
+                    &mut chains,
+                    &self.chain_config,
+                )
+                .await?;
             }
         }
 
@@ -601,7 +620,7 @@ fn merge_and_trim(
     (result, gas_limit)
 }
 
-/// Like head_change, except it doesnt change the state of the MessagePool.
+/// Like `head_change`, except it doesn't change the state of the `MessagePool`.
 /// It simulates a head change call.
 pub(crate) async fn run_head_change<T>(
     api: &RwLock<T>,
@@ -649,7 +668,7 @@ where
                     .await?;
             }
             for msg in msgs {
-                remove_from_selected_msgs(msg.from(), pending, msg.sequence(), rmsgs.borrow_mut())
+                remove_from_selected_msgs(&msg.from, pending, msg.sequence, rmsgs.borrow_mut())
                     .await?;
             }
         }
@@ -666,12 +685,12 @@ mod test_selection {
     use crate::msgpool::tests::create_smsg;
     use async_std::channel::bounded;
     use async_std::task;
-    use crypto::SignatureType;
-    use db::MemoryDB;
+    use fil_types::NetworkParams;
+    use forest_db::MemoryDB;
+    use forest_message::Message;
+    use fvm_shared::crypto::signature::SignatureType;
     use key_management::{KeyStore, KeyStoreConfig, Wallet};
-    use message::Message;
     use std::sync::Arc;
-    use types::NetworkParams;
 
     const TEST_GAS_LIMIT: i64 = 6955002;
 
@@ -679,7 +698,14 @@ mod test_selection {
         let tma = TestApi::default();
         task::block_on(async move {
             let (tx, _rx) = bounded(50);
-            MessagePool::new(tma, "mptest".to_string(), tx, Default::default()).await
+            MessagePool::new(
+                tma,
+                "mptest".to_string(),
+                tx,
+                Default::default(),
+                Arc::default(),
+            )
+            .await
         })
         .unwrap()
     }
@@ -721,10 +747,10 @@ mod test_selection {
         // let gas_limit = 6955002;
         api.write()
             .await
-            .set_state_balance_raw(&a1, types::DefaultNetworkParams::from_fil(1));
+            .set_state_balance_raw(&a1, fil_types::DefaultNetworkParams::from_fil(1));
         api.write()
             .await
-            .set_state_balance_raw(&a2, types::DefaultNetworkParams::from_fil(1));
+            .set_state_balance_raw(&a2, fil_types::DefaultNetworkParams::from_fil(1));
 
         // we create 10 messages from each actor to another, with the first actor paying higher
         // gas prices than the second; we expect message selection to order his messages first
@@ -891,12 +917,12 @@ mod test_selection {
         // let gas_limit = 6955002;
         api.write()
             .await
-            .set_state_balance_raw(&a1, types::DefaultNetworkParams::from_fil(1));
+            .set_state_balance_raw(&a1, fil_types::DefaultNetworkParams::from_fil(1));
         api.write()
             .await
-            .set_state_balance_raw(&a2, types::DefaultNetworkParams::from_fil(1));
+            .set_state_balance_raw(&a2, fil_types::DefaultNetworkParams::from_fil(1));
 
-        let nmsgs = (types::BLOCK_GAS_LIMIT / TEST_GAS_LIMIT) + 1;
+        let nmsgs = (fil_types::BLOCK_GAS_LIMIT / TEST_GAS_LIMIT) + 1;
 
         // make many small chains for the two actors
         for i in 0..nmsgs {
@@ -923,13 +949,13 @@ mod test_selection {
 
         let msgs = mpool.select_messages(&ts, 1.0).await.unwrap();
 
-        let expected = types::BLOCK_GAS_LIMIT / TEST_GAS_LIMIT;
+        let expected = fil_types::BLOCK_GAS_LIMIT / TEST_GAS_LIMIT;
         assert_eq!(msgs.len(), expected as usize);
         let mut m_gas_lim = 0;
         for m in msgs.iter() {
             m_gas_lim += m.gas_limit();
         }
-        assert!(m_gas_lim <= types::BLOCK_GAS_LIMIT);
+        assert!(m_gas_lim <= fil_types::BLOCK_GAS_LIMIT);
     }
 
     #[async_std::test]
@@ -975,10 +1001,10 @@ mod test_selection {
         // let gas_limit = 6955002;
         api.write()
             .await
-            .set_state_balance_raw(&a1, types::DefaultNetworkParams::from_fil(1));
+            .set_state_balance_raw(&a1, fil_types::DefaultNetworkParams::from_fil(1));
         api.write()
             .await
-            .set_state_balance_raw(&a2, types::DefaultNetworkParams::from_fil(1));
+            .set_state_balance_raw(&a2, fil_types::DefaultNetworkParams::from_fil(1));
 
         let nmsgs = 10;
 
@@ -1071,13 +1097,13 @@ mod test_selection {
 
         api.write()
             .await
-            .set_state_balance_raw(&a1, types::DefaultNetworkParams::from_fil(1));
+            .set_state_balance_raw(&a1, fil_types::DefaultNetworkParams::from_fil(1));
 
         api.write()
             .await
-            .set_state_balance_raw(&a2, types::DefaultNetworkParams::from_fil(1));
+            .set_state_balance_raw(&a2, fil_types::DefaultNetworkParams::from_fil(1));
 
-        let n_msgs = 10 * types::BLOCK_GAS_LIMIT / TEST_GAS_LIMIT;
+        let n_msgs = 10 * fil_types::BLOCK_GAS_LIMIT / TEST_GAS_LIMIT;
 
         // we create 10 messages from each actor to another, with the first actor paying higher
         // gas prices than the second; we expect message selection to order his messages first
@@ -1096,12 +1122,12 @@ mod test_selection {
 
         let msgs = mpool.select_messages(&ts, 0.25).await.unwrap();
 
-        let expected_msgs = types::BLOCK_GAS_LIMIT / TEST_GAS_LIMIT;
+        let expected_msgs = fil_types::BLOCK_GAS_LIMIT / TEST_GAS_LIMIT;
 
         assert_eq!(msgs.len(), expected_msgs as usize);
 
         for (next_nonce, m) in msgs.into_iter().enumerate() {
-            assert_eq!(m.message().from(), &a1, "Expected message from a1");
+            assert_eq!(m.message().from, a1, "Expected message from a1");
             assert_eq!(
                 m.message().sequence,
                 next_nonce as u64,
@@ -1153,13 +1179,13 @@ mod test_selection {
 
         api.write()
             .await
-            .set_state_balance_raw(&a1, types::DefaultNetworkParams::from_fil(1)); // in FIL
+            .set_state_balance_raw(&a1, fil_types::DefaultNetworkParams::from_fil(1)); // in FIL
 
         api.write()
             .await
-            .set_state_balance_raw(&a2, types::DefaultNetworkParams::from_fil(1)); // in FIL
+            .set_state_balance_raw(&a2, fil_types::DefaultNetworkParams::from_fil(1)); // in FIL
 
-        let n_msgs = 5 * types::BLOCK_GAS_LIMIT / TEST_GAS_LIMIT;
+        let n_msgs = 5 * fil_types::BLOCK_GAS_LIMIT / TEST_GAS_LIMIT;
         for i in 0..n_msgs as usize {
             let bias = (n_msgs as usize - i) / 3;
             let m = create_smsg(
@@ -1184,7 +1210,7 @@ mod test_selection {
 
         let msgs = mpool.select_messages(&ts, 0.1).await.unwrap();
 
-        let expected_msgs = types::BLOCK_GAS_LIMIT / TEST_GAS_LIMIT;
+        let expected_msgs = fil_types::BLOCK_GAS_LIMIT / TEST_GAS_LIMIT;
         assert_eq!(
             msgs.len(),
             expected_msgs as usize,
@@ -1199,7 +1225,7 @@ mod test_selection {
         let mut next_nonce2 = 0;
 
         for m in msgs {
-            if m.message.from() == &a1 {
+            if m.message.from == a1 {
                 if m.message.sequence != next_nonce1 {
                     panic!(
                         "Expected nonce {}, but got {}",
@@ -1276,11 +1302,11 @@ mod test_selection {
         for a in &mut actors {
             api.write()
                 .await
-                .set_state_balance_raw(a, types::DefaultNetworkParams::from_fil(1));
+                .set_state_balance_raw(a, fil_types::DefaultNetworkParams::from_fil(1));
             // in FIL
         }
 
-        let n_msgs = 1 + types::BLOCK_GAS_LIMIT / TEST_GAS_LIMIT;
+        let n_msgs = 1 + fil_types::BLOCK_GAS_LIMIT / TEST_GAS_LIMIT;
         for i in 0..n_msgs {
             for j in 0..n_actors {
                 let premium =
@@ -1298,7 +1324,7 @@ mod test_selection {
         }
 
         let msgs = mpool.select_messages(&ts, 0.1).await.unwrap();
-        let expected_msgs = types::BLOCK_GAS_LIMIT / TEST_GAS_LIMIT;
+        let expected_msgs = fil_types::BLOCK_GAS_LIMIT / TEST_GAS_LIMIT;
 
         assert_eq!(
             msgs.len(),
@@ -1310,7 +1336,7 @@ mod test_selection {
 
         let who_is = |addr| -> usize {
             for (i, a) in actors.iter().enumerate() {
-                if a == addr {
+                if a == &addr {
                     return i;
                 }
             }
@@ -1320,7 +1346,7 @@ mod test_selection {
 
         let mut nonces = vec![0; n_actors as usize];
         for m in &msgs {
-            let who = who_is(m.message.from()) as usize;
+            let who = who_is(m.message.from) as usize;
             if who < 3 {
                 panic!("got message from {}th actor", who);
             }

@@ -1,34 +1,38 @@
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
+use crate::Scale;
+
 use super::{index::ChainIndex, tipset_tracker::TipsetTracker, Error};
-use actor::{miner, power};
-use address::Address;
+use actor_interface::{miner, EPOCHS_IN_DAY};
 use async_std::channel::{self, bounded, Receiver};
 use async_std::sync::RwLock;
 use async_std::task;
 use beacon::{BeaconEntry, IGNORE_DRAND_VAR};
-use blocks::{Block, BlockHeader, FullTipset, Tipset, TipsetKeys, TxMeta};
-use cid::Cid;
-use cid::Code::Blake2b256;
-use clock::ChainEpoch;
+use bls_signatures::Serialize as SerializeBls;
+use cid::{multihash::Code::Blake2b256, Cid};
 use crossbeam::atomic::AtomicCell;
-use encoding::{de::DeserializeOwned, from_slice, Cbor};
-use forest_car::CarHeader;
+use forest_blocks::{Block, BlockHeader, FullTipset, Tipset, TipsetKeys, TxMeta};
+use forest_encoding::de::DeserializeOwned;
 use forest_ipld::recurse_links;
+use forest_message::Message as MessageTrait;
+use forest_message::{ChainMessage, MessageReceipt, SignedMessage};
 use futures::AsyncWrite;
+use fvm::state_tree::StateTree;
+use fvm_ipld_car::CarHeader;
+use fvm_ipld_encoding::{from_slice, Cbor};
+use fvm_shared::address::Address;
+use fvm_shared::bigint::BigInt;
+use fvm_shared::clock::ChainEpoch;
+use fvm_shared::crypto::signature::{Signature, SignatureType};
+use fvm_shared::message::Message;
 use interpreter::BlockMessages;
-use ipld_amt::Amt;
-use ipld_blockstore::BlockStore;
+use ipld_blockstore::{BlockStore, BlockStoreExt};
+use legacy_ipld_amt::Amt;
 use lockfree::map::Map as LockfreeMap;
 use log::{debug, info, trace, warn};
 use lru::LruCache;
-use message::{ChainMessage, Message, MessageReceipt, SignedMessage, UnsignedMessage};
-use num_bigint::{BigInt, Integer};
-use num_traits::Zero;
 use serde::Serialize;
-use state_tree::StateTree;
-use std::error::Error as StdError;
 use std::sync::Arc;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -40,19 +44,12 @@ const GENESIS_KEY: &str = "gen_block";
 const HEAD_KEY: &str = "head";
 const BLOCK_VAL_PREFIX: &[u8] = b"block_val/";
 
-// constants for Weight calculation
-/// The ratio of weight contributed by short-term vs long-term factors in a given round
-const W_RATIO_NUM: u64 = 1;
-const W_RATIO_DEN: u64 = 2;
-/// Blocks epoch allowed
-const BLOCKS_PER_EPOCH: u64 = 5;
-
 // A cap on the size of the future_sink
 const SINK_CAP: usize = 200;
 
 const DEFAULT_TIPSET_CACHE_SIZE: usize = 8192;
 
-/// Enum for pubsub channel that defines message type variant and data contained in message type.
+/// `Enum` for `pubsub` channel that defines message type variant and data contained in message type.
 #[derive(Clone, Debug)]
 pub enum HeadChange {
     Current(Arc<Tipset>),
@@ -61,7 +58,7 @@ pub enum HeadChange {
 }
 
 /// Stores chain data such as heaviest tipset and cached tipset info at each epoch.
-/// This structure is threadsafe, and all caches are wrapped in a mutex to allow a consistent
+/// This structure is thread-safe, and all caches are wrapped in a mutex to allow a consistent
 /// `ChainStore` to be shared across tasks.
 pub struct ChainStore<DB> {
     /// Publisher for head change events
@@ -73,7 +70,7 @@ pub struct ChainStore<DB> {
     /// Keeps track of how many subscriptions there are in order to auto-increment the subscription ID
     subscriptions_count: AtomicCell<usize>,
 
-    /// key-value datastore.
+    /// key-value `datastore`.
     pub db: Arc<DB>,
 
     /// Tipset at the head of the best-known chain.
@@ -82,7 +79,7 @@ pub struct ChainStore<DB> {
     /// Caches loaded tipsets for fast retrieval.
     ts_cache: Arc<TipsetCache>,
 
-    /// Used as a cache for tipset lookbacks.
+    /// Used as a cache for tipset `lookbacks`.
     chain_index: ChainIndex<DB>,
 
     /// Tracks blocks for the purpose of forming tipsets.
@@ -113,7 +110,7 @@ where
         cs
     }
 
-    /// Sets heaviest tipset within ChainStore and store its tipset cids under HEAD_KEY
+    /// Sets heaviest tipset within `ChainStore` and store its tipset keys under `HEAD_KEY`
     pub async fn set_heaviest_tipset(&self, ts: Arc<Tipset>) -> Result<(), Error> {
         self.db.write(HEAD_KEY, ts.key().marshal_cbor()?)?;
         *self.heaviest.write().await = Some(ts.clone());
@@ -123,27 +120,30 @@ where
         Ok(())
     }
 
-    /// Writes genesis to blockstore.
+    /// Writes genesis to `blockstore`.
     pub fn set_genesis(&self, header: &BlockHeader) -> Result<Cid, Error> {
         set_genesis(self.blockstore(), header)
     }
 
-    /// Adds a [BlockHeader] to the tipset tracker, which tracks valid headers.
+    /// Adds a [`BlockHeader`] to the tipset tracker, which tracks valid headers.
     pub async fn add_to_tipset_tracker(&self, header: &BlockHeader) {
         self.tipset_tracker.add(header).await;
     }
 
     /// Writes tipset block headers to data store and updates heaviest tipset with other
     /// compatible tracked headers.
-    pub async fn put_tipset(&self, ts: &Tipset) -> Result<(), Error> {
+    pub async fn put_tipset<S>(&self, ts: &Tipset) -> Result<(), Error>
+    where
+        S: Scale,
+    {
         // TODO: we could add the blocks of `ts` to the tipset tracker from here,
         // making `add_to_tipset_tracker` redundant and decreasing the number of
-        // blockstore reads
+        // `blockstore` reads
         persist_objects(self.blockstore(), ts.blocks())?;
 
         // Expand tipset to include other compatible blocks at the epoch.
         let expanded = self.expand_tipset(ts.min_ticket_block().clone()).await?;
-        self.update_heaviest(Arc::new(expanded)).await?;
+        self.update_heaviest::<S>(Arc::new(expanded)).await?;
         Ok(())
     }
 
@@ -152,7 +152,7 @@ where
         self.tipset_tracker.expand(header).await
     }
 
-    /// Loads heaviest tipset from datastore and sets as heaviest in chainstore.
+    /// Loads heaviest tipset from `datastore` and sets as heaviest in `chainstore`.
     async fn load_heaviest_tipset(&self) -> Result<(), Error> {
         let heaviest_ts = match self.db.read(HEAD_KEY)? {
             Some(bz) => self.tipset_from_keys(&from_slice(&bz)?).await?,
@@ -167,7 +167,7 @@ where
         Ok(())
     }
 
-    /// Returns genesis [BlockHeader] from the store based on a static key.
+    /// Returns genesis [`BlockHeader`] from the store based on a static key.
     pub fn genesis(&self) -> Result<Option<BlockHeader>, Error> {
         genesis(self.blockstore())
     }
@@ -188,12 +188,12 @@ where
         &self.db
     }
 
-    /// Clones blockstore `Arc`.
+    /// Clones `blockstore` `Arc`.
     pub fn blockstore_cloned(&self) -> Arc<DB> {
         self.db.clone()
     }
 
-    /// Returns Tipset from key-value store from provided cids
+    /// Returns Tipset from key-value store from provided CIDs
     pub async fn tipset_from_keys(&self, tsk: &TipsetKeys) -> Result<Arc<Tipset>, Error> {
         if tsk.cids().is_empty() {
             return Ok(self.heaviest_tipset().await.unwrap());
@@ -202,18 +202,23 @@ where
     }
 
     /// Determines if provided tipset is heavier than existing known heaviest tipset
-    async fn update_heaviest(&self, ts: Arc<Tipset>) -> Result<(), Error> {
+    async fn update_heaviest<S>(&self, ts: Arc<Tipset>) -> Result<(), Error>
+    where
+        S: Scale,
+    {
         // Calculate heaviest weight before matching to avoid deadlock with mutex
         let heaviest_weight = self
             .heaviest
             .read()
             .await
             .as_ref()
-            .map(|ts| weight(self.db.as_ref(), ts.as_ref()));
+            .map(|ts| S::weight(self.blockstore(), ts.as_ref()));
+
         match heaviest_weight {
             Some(heaviest) => {
-                let new_weight = weight(self.blockstore(), ts.as_ref())?;
+                let new_weight = S::weight(self.blockstore(), ts.as_ref())?;
                 let curr_weight = heaviest?;
+
                 if new_weight > curr_weight {
                     // TODO potentially need to deal with re-orgs here
                     info!("New heaviest tipset: {:?}", ts.key());
@@ -363,6 +368,8 @@ where
     }
 
     /// Retrieves block messages to be passed through the VM.
+    ///
+    /// It removes duplicate messages which appear in multiple blocks.
     pub fn block_msgs_for_tipset(&self, ts: &Tipset) -> Result<Vec<BlockMessages>, Error> {
         let mut applied = HashMap::new();
         let mut select_msg = |m: ChainMessage| -> Option<ChainMessage> {
@@ -406,9 +413,12 @@ where
             .collect()
     }
 
-    async fn parent_state_tsk(&self, key: &TipsetKeys) -> Result<StateTree<'_, DB>, Error> {
+    async fn parent_state_tsk<'a>(
+        &'a self,
+        key: &TipsetKeys,
+    ) -> anyhow::Result<StateTree<&'a DB>, Error> {
         let ts = self.tipset_from_keys(key).await?;
-        StateTree::new_from_root(&*self.db, ts.parent_state())
+        StateTree::new_from_root(self.blockstore(), ts.parent_state())
             .map_err(|e| Error::Other(format!("Could not get actor state {:?}", e)))
     }
 
@@ -424,14 +434,14 @@ where
         &self,
         address: &Address,
         tsk: &TipsetKeys,
-    ) -> Result<miner::State, Error> {
+    ) -> anyhow::Result<miner::State> {
         let state = self.parent_state_tsk(tsk).await?;
         let actor = state
             .get_actor(address)
             .map_err(|_| Error::Other("Failure getting actor".to_string()))?
             .ok_or_else(|| Error::Other("Could not init State Tree".to_string()))?;
 
-        Ok(miner::State::load(self.blockstore(), &actor)?)
+        miner::State::load(self.blockstore(), &actor)
     }
 
     /// Exports a range of tipsets, as well as the state roots based on the `recent_roots`.
@@ -462,7 +472,7 @@ where
             let block = self
                 .blockstore()
                 .get_bytes(&cid)?
-                .ok_or_else(|| format!("Cid {} not found in blockstore", cid))?;
+                .ok_or_else(|| anyhow::anyhow!("Cid {} not found in blockstore", cid))?;
 
             // * If cb can return a generic type, deserializing would remove need to clone.
             // Ignore error intentionally, if receiver dropped, error will be handled below
@@ -578,7 +588,7 @@ where
         mut load_block: F,
     ) -> Result<(), Error>
     where
-        F: FnMut(Cid) -> Result<Vec<u8>, Box<dyn StdError>>,
+        F: FnMut(Cid) -> Result<Vec<u8>, anyhow::Error>,
     {
         let mut seen = HashSet::<Cid>::new();
         let mut blocks_to_walk: VecDeque<Cid> = tipset.cids().to_vec().into();
@@ -596,6 +606,9 @@ where
 
             if current_min_height > h.epoch() {
                 current_min_height = h.epoch();
+                if current_min_height % EPOCHS_IN_DAY == 0 {
+                    info!(target: "chain_api", "export at: {}", current_min_height);
+                }
             }
 
             if !skip_old_msgs || h.epoch() > incl_roots_epoch {
@@ -640,7 +653,7 @@ where
         .iter()
         .map(|c| {
             store
-                .get(c)
+                .get_obj(c)
                 .map_err(|e| Error::Other(e.to_string()))?
                 .ok_or_else(|| Error::NotFound(String::from("Key for header")))
         })
@@ -652,7 +665,7 @@ where
     Ok(ts)
 }
 
-/// Helper to ensure consistent Cid -> db key translation.
+/// Helper to ensure consistent CID to db key translation.
 fn block_validation_key(cid: &Cid) -> Vec<u8> {
     let mut key = Vec::new();
     key.extend_from_slice(BLOCK_VAL_PREFIX);
@@ -660,46 +673,46 @@ fn block_validation_key(cid: &Cid) -> Vec<u8> {
     key
 }
 
-/// Returns a Tuple of bls messages of type UnsignedMessage and secp messages
-/// of type SignedMessage
+/// Returns a Tuple of BLS messages of type `UnsignedMessage` and SECP messages
+/// of type `SignedMessage`
 pub fn block_messages<DB>(
     db: &DB,
     bh: &BlockHeader,
-) -> Result<(Vec<UnsignedMessage>, Vec<SignedMessage>), Error>
+) -> Result<(Vec<Message>, Vec<SignedMessage>), Error>
 where
     DB: BlockStore,
 {
     let (bls_cids, secpk_cids) = read_msg_cids(db, bh.messages())?;
 
-    let bls_msgs: Vec<UnsignedMessage> = messages_from_cids(db, &bls_cids)?;
+    let bls_msgs: Vec<Message> = messages_from_cids(db, &bls_cids)?;
     let secp_msgs: Vec<SignedMessage> = messages_from_cids(db, &secpk_cids)?;
 
     Ok((bls_msgs, secp_msgs))
 }
 
-/// Returns a tuple of UnsignedMessage and SignedMessages from their Cid
+/// Returns a tuple of `UnsignedMessage` and `SignedMessages` from their CID
 pub fn block_messages_from_cids<DB>(
     db: &DB,
     bls_cids: &[Cid],
     secp_cids: &[Cid],
-) -> Result<(Vec<UnsignedMessage>, Vec<SignedMessage>), Error>
+) -> Result<(Vec<Message>, Vec<SignedMessage>), Error>
 where
     DB: BlockStore,
 {
-    let bls_msgs: Vec<UnsignedMessage> = messages_from_cids(db, bls_cids)?;
+    let bls_msgs: Vec<Message> = messages_from_cids(db, bls_cids)?;
     let secp_msgs: Vec<SignedMessage> = messages_from_cids(db, secp_cids)?;
 
     Ok((bls_msgs, secp_msgs))
 }
 
-/// Returns a tuple of cids for both Unsigned and Signed messages
+/// Returns a tuple of CIDs for both unsigned and signed messages
 // TODO cache these recent meta roots
 pub fn read_msg_cids<DB>(db: &DB, msg_cid: &Cid) -> Result<(Vec<Cid>, Vec<Cid>), Error>
 where
     DB: BlockStore,
 {
     if let Some(roots) = db
-        .get::<TxMeta>(msg_cid)
+        .get_obj::<TxMeta>(msg_cid)
         .map_err(|e| Error::Other(e.to_string()))?
     {
         let bls_cids = read_amt_cids(db, &roots.bls_message_root)?;
@@ -713,19 +726,19 @@ where
     }
 }
 
-/// Sets the genesis key in the BlockStore. Be careful if using this outside of
-/// the ChainStore as it will not update what the ChainStore thinks is the genesis
-/// after the ChainStore has been created.
+/// Sets the genesis key in the `BlockStore`. Be careful if using this outside of
+/// the `ChainStore` as it will not update what the `ChainStore` thinks is the genesis
+/// after the `ChainStore` has been created.
 pub fn set_genesis<DB>(db: &DB, header: &BlockHeader) -> Result<Cid, Error>
 where
     DB: BlockStore,
 {
     db.write(GENESIS_KEY, header.marshal_cbor()?)?;
-    db.put(&header, Blake2b256)
+    db.put_obj(&header, Blake2b256)
         .map_err(|e| Error::Other(e.to_string()))
 }
 
-/// Persists slice of serializable objects to blockstore.
+/// Persists slice of `serializable` objects to `blockstore`.
 pub fn persist_objects<DB, C>(db: &DB, headers: &[C]) -> Result<(), Error>
 where
     DB: BlockStore,
@@ -738,7 +751,7 @@ where
     Ok(())
 }
 
-/// Returns a vector of cids from provided root cid
+/// Returns a vector of CIDs from provided root CID
 fn read_amt_cids<DB>(db: &DB, root: &Cid) -> Result<Vec<Cid>, Error>
 where
     DB: BlockStore,
@@ -766,13 +779,13 @@ where
         .transpose()?)
 }
 
-/// Attempts to deserialize to unsigend message or signed message and then returns it at as a
-// [ChainMessage].
+/// Attempts to de-serialize to unsigned message or signed message and then returns it as a
+/// [`ChainMessage`].
 pub fn get_chain_message<DB>(db: &DB, key: &Cid) -> Result<ChainMessage, Error>
 where
     DB: BlockStore,
 {
-    db.get(key)
+    db.get_obj(key)
         .map_err(|e| Error::Other(e.to_string()))?
         .ok_or_else(|| Error::UndefinedKey(key.to_string()))
 }
@@ -835,7 +848,7 @@ where
     })
 }
 
-/// Returns messages from key-value store based on a slice of [Cid]s.
+/// Returns messages from key-value store based on a slice of [`Cid`]s.
 pub fn messages_from_cids<DB, T>(db: &DB, keys: &[Cid]) -> Result<Vec<T>, Error>
 where
     DB: BlockStore,
@@ -843,14 +856,14 @@ where
 {
     keys.iter()
         .map(|k| {
-            db.get(k)
+            db.get_obj(k)
                 .map_err(|e| Error::Other(e.to_string()))?
                 .ok_or_else(|| Error::UndefinedKey(k.to_string()))
         })
         .collect()
 }
 
-/// Returns parent message receipt given block_header and message index.
+/// Returns parent message receipt given `block_header` and message index.
 pub fn get_parent_reciept<DB>(
     db: &DB,
     block_header: &BlockHeader,
@@ -860,59 +873,13 @@ where
     DB: BlockStore,
 {
     let amt = Amt::load(block_header.message_receipts(), db)?;
-    let receipts = amt.get(i as u64)?;
+    let receipts = amt.get(i)?;
     Ok(receipts.cloned())
 }
 
-/// Returns the weight of provided [Tipset]. This function will load power actor state
-/// and calculate the total weight of the [Tipset].
-pub fn weight<DB>(db: &DB, ts: &Tipset) -> Result<BigInt, String>
-where
-    DB: BlockStore,
-{
-    let state = StateTree::new_from_root(db, ts.parent_state()).map_err(|e| e.to_string())?;
-
-    let act = state
-        .get_actor(power::ADDRESS)
-        .map_err(|e| e.to_string())?
-        .ok_or("Failed to load power actor for calculating weight")?;
-
-    let state = power::State::load(db, &act).map_err(|e| e.to_string())?;
-
-    let tpow = state.into_total_quality_adj_power();
-
-    let log2_p = if tpow > BigInt::zero() {
-        BigInt::from(tpow.bits() - 1)
-    } else {
-        return Err(
-            "All power in the net is gone. You network might be disconnected, or the net is dead!"
-                .to_owned(),
-        );
-    };
-
-    let mut total_j = 0;
-    for b in ts.blocks() {
-        total_j += b
-            .election_proof()
-            .as_ref()
-            .ok_or("Block contained no election proof when calculating weight")?
-            .win_count;
-    }
-
-    let mut out = ts.weight().to_owned();
-    out += &log2_p << 8;
-    let mut e_weight: BigInt = log2_p * W_RATIO_NUM;
-    e_weight <<= 8;
-    e_weight *= total_j;
-    e_weight = e_weight.div_floor(&(BigInt::from(BLOCKS_PER_EPOCH * W_RATIO_DEN)));
-    out += &e_weight;
-    Ok(out)
-}
-
-#[cfg(feature = "json")]
 pub mod headchange_json {
     use super::*;
-    use blocks::tipset_json::TipsetJson;
+    use forest_blocks::tipset_json::TipsetJson;
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Deserialize, Serialize)]
@@ -937,24 +904,98 @@ pub mod headchange_json {
     }
 }
 
+/// Result of persisting a vector of `SignedMessage`s that are to be included in a block.
+///
+/// The fields are public so they can be partially moved, but they should not be modified.
+pub struct PersistedBlockMessages {
+    /// Overall CID to be included in the `BlockHeader`.
+    pub msg_cid: Cid,
+    /// All CIDs of SECP messages, to be included in `BlockMsg`.
+    pub secp_cids: Vec<Cid>,
+    /// All CIDs of BLS messages, to be included in `BlockMsg`.
+    pub bls_cids: Vec<Cid>,
+    /// Aggregated signature of all BLS messages, to be included in the `BlockHeader`.
+    pub bls_agg: Signature,
+}
+
+/// Partition the messages into SECP and BLS variants, store them individually in the IPLD store,
+/// and the corresponding `TxMeta` as well, returning its CID so that it can be put in a block header.
+/// Also return the aggregated BLS signature of all BLS messages.
+pub fn persist_block_messages<DB: BlockStore>(
+    db: &DB,
+    messages: Vec<&SignedMessage>,
+) -> anyhow::Result<PersistedBlockMessages> {
+    let mut bls_cids = Vec::new();
+    let mut secp_cids = Vec::new();
+
+    let mut bls_sigs = Vec::new();
+    for msg in messages {
+        if msg.signature().signature_type() == SignatureType::BLS {
+            let c = db.put_obj(&msg.message, Blake2b256)?;
+            bls_cids.push(c);
+            bls_sigs.push(&msg.signature);
+        } else {
+            let c = db.put_obj(&msg, Blake2b256)?;
+            secp_cids.push(c);
+        }
+    }
+
+    let bls_msg_root = Amt::new_from_iter(db, bls_cids.iter().copied())?;
+    let secp_msg_root = Amt::new_from_iter(db, secp_cids.iter().copied())?;
+
+    let mmcid = db.put_obj(
+        &TxMeta {
+            bls_message_root: bls_msg_root,
+            secp_message_root: secp_msg_root,
+        },
+        Blake2b256,
+    )?;
+
+    let bls_agg = if bls_sigs.is_empty() {
+        Signature::new_bls(vec![])
+    } else {
+        Signature::new_bls(
+            bls_signatures::aggregate(
+                &bls_sigs
+                    .iter()
+                    .map(|s| s.bytes())
+                    .map(bls_signatures::Signature::from_bytes)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .unwrap()
+            .as_bytes(),
+        )
+    };
+
+    Ok(PersistedBlockMessages {
+        msg_cid: mmcid,
+        secp_cids,
+        bls_cids,
+        bls_agg,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use address::Address;
     use async_std::sync::Arc;
-    use cid::Code::{Blake2b256, Identity};
+    use cid::multihash::Code::{Blake2b256, Identity};
+    use cid::multihash::MultihashDigest;
+    use cid::Cid;
+    use fvm_ipld_encoding::DAG_CBOR;
+    use fvm_shared::address::Address;
 
     #[test]
     fn genesis_test() {
-        let db = db::MemoryDB::default();
+        let db = forest_db::MemoryDB::default();
 
         let cs = ChainStore::new(Arc::new(db));
         let gen_block = BlockHeader::builder()
             .epoch(1)
             .weight(2_u32.into())
-            .messages(cid::new_from_cbor(&[], Identity))
-            .message_receipts(cid::new_from_cbor(&[], Identity))
-            .state_root(cid::new_from_cbor(&[], Identity))
+            .messages(Cid::new_v1(DAG_CBOR, Identity.digest(&[])))
+            .message_receipts(Cid::new_v1(DAG_CBOR, Identity.digest(&[])))
+            .state_root(Cid::new_v1(DAG_CBOR, Identity.digest(&[])))
             .miner_address(Address::new_id(0))
             .build()
             .unwrap();
@@ -966,11 +1007,11 @@ mod tests {
 
     #[test]
     fn block_validation_cache_basic() {
-        let db = db::MemoryDB::default();
+        let db = forest_db::MemoryDB::default();
 
         let cs = ChainStore::new(Arc::new(db));
 
-        let cid = cid::new_from_cbor(&[1, 2, 3], Blake2b256);
+        let cid = Cid::new_v1(DAG_CBOR, Blake2b256.digest(&[1, 2, 3]));
         assert!(!cs.is_block_validated(&cid).unwrap());
 
         cs.mark_block_as_validated(&cid).unwrap();

@@ -3,22 +3,25 @@
 
 #![cfg(feature = "test_constructors")]
 
-use address::Address;
-use blocks::{Block, BlockHeader, FullTipset, Ticket, Tipset, TipsetKeys, TxMeta};
-use cid::{Cid, Code::Blake2b256};
-use crypto::{Signature, Signer, VRFProof};
-use encoding::to_vec;
+use cid::multihash::Code::Blake2b256;
+use cid::multihash::MultihashDigest;
+use cid::Cid;
+use forest_blocks::{Block, BlockHeader, FullTipset, Ticket, Tipset, TipsetKeys, TxMeta};
+use forest_crypto::{Signer, VRFProof};
 use forest_libp2p::chain_exchange::{
     ChainExchangeResponse, ChainExchangeResponseStatus, CompactedMessages, TipsetBundle,
 };
-use message::{SignedMessage, UnsignedMessage};
-use num_bigint::BigInt;
+use forest_message::SignedMessage;
+use fvm_ipld_encoding::to_vec;
+use fvm_ipld_encoding::DAG_CBOR;
+use fvm_shared::address::Address;
+use fvm_shared::crypto::signature::Signature;
+use fvm_shared::{bigint::BigInt, message::Message};
 use std::convert::TryFrom;
-use std::error::Error;
 
 /// Defines a TipsetKey used in testing
 pub fn template_key(data: &[u8]) -> Cid {
-    cid::new_from_cbor(data, Blake2b256)
+    Cid::new_v1(DAG_CBOR, Blake2b256.digest(data))
 }
 
 /// Defines a block header used in testing
@@ -49,12 +52,12 @@ fn template_header(
 
 /// Returns a vec of 4 distinct CIDs
 pub fn construct_keys() -> Vec<Cid> {
-    return vec![
+    vec![
         template_key(b"test content"),
         template_key(b"awesome test content "),
         template_key(b"even better test content"),
         template_key(b"the best test content out there"),
-    ];
+    ]
 }
 
 /// Returns a vec of block headers to be used for testing purposes
@@ -74,13 +77,13 @@ pub fn construct_headers(epoch: i64, weight: u64) -> Vec<BlockHeader> {
         .unwrap(),
     };
     let bz = to_vec(&meta).unwrap();
-    let msg_root = cid::new_from_cbor(&bz, Blake2b256);
+    let msg_root = Cid::new_v1(DAG_CBOR, Blake2b256.digest(&bz));
 
-    return vec![
+    vec![
         template_header(data0, 1, epoch, msg_root, weight),
         template_header(data1, 2, epoch, msg_root, weight),
         template_header(data2, 3, epoch, msg_root, weight),
-    ];
+    ]
 }
 
 /// Returns a Ticket to be used for testing
@@ -129,18 +132,18 @@ const DUMMY_SIG: [u8; 1] = [0u8];
 
 struct DummySigner;
 impl Signer for DummySigner {
-    fn sign_bytes(&self, _: &[u8], _: &Address) -> Result<Signature, Box<dyn Error>> {
+    fn sign_bytes(&self, _: &[u8], _: &Address) -> Result<Signature, anyhow::Error> {
         Ok(Signature::new_secp256k1(DUMMY_SIG.to_vec()))
     }
 }
 
 /// Returns a tuple of unsigned and signed messages used for testing
-pub fn construct_messages() -> (UnsignedMessage, SignedMessage) {
-    let bls_messages = UnsignedMessage::builder()
-        .to(Address::new_id(1))
-        .from(Address::new_id(2))
-        .build()
-        .unwrap();
+pub fn construct_messages() -> (Message, SignedMessage) {
+    let bls_messages = Message {
+        to: Address::new_id(1),
+        from: Address::new_id(2),
+        ..Message::default()
+    };
 
     let secp_messages = SignedMessage::new(bls_messages.clone(), &DummySigner).unwrap();
     (bls_messages, secp_messages)
@@ -166,9 +169,9 @@ pub fn construct_tipset_bundle(epoch: i64, weight: u64) -> TipsetBundle {
 pub fn construct_dummy_header() -> BlockHeader {
     BlockHeader::builder()
         .miner_address(Address::new_id(1000))
-        .messages(cid::new_from_cbor(&[1, 2, 3], Blake2b256))
-        .message_receipts(cid::new_from_cbor(&[1, 2, 3], Blake2b256))
-        .state_root(cid::new_from_cbor(&[1, 2, 3], Blake2b256))
+        .messages(Cid::new_v1(DAG_CBOR, Blake2b256.digest(&[1, 2, 3])))
+        .message_receipts(Cid::new_v1(DAG_CBOR, Blake2b256.digest(&[1, 2, 3])))
+        .state_root(Cid::new_v1(DAG_CBOR, Blake2b256.digest(&[1, 2, 3])))
         .build()
         .unwrap()
 }

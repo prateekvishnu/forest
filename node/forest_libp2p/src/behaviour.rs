@@ -14,7 +14,7 @@ use crate::{
     discovery::DiscoveryConfig,
     hello::{HelloCodec, HelloProtocolName, HelloRequest, HelloResponse},
 };
-use forest_cid::Cid;
+use cid::Cid;
 use forest_encoding::blake2b_256;
 use futures::channel::oneshot::{self, Sender as OneShotSender};
 use futures::{prelude::*, stream::FuturesUnordered};
@@ -46,7 +46,6 @@ use libp2p_bitswap::{Bitswap, BitswapEvent, Priority};
 use log::{debug, trace, warn};
 use std::collections::HashSet;
 use std::convert::TryFrom;
-use std::error::Error;
 use std::pin::Pin;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -56,7 +55,7 @@ use tiny_cid::Cid as Cid2;
 
 lazy_static! {
     static ref VERSION: &'static str = env!("CARGO_PKG_VERSION");
-    static ref CURRENT_COMMIT: &'static str = git_version!();
+    static ref CURRENT_COMMIT: &'static str = git_version!(fallback = "unknown");
 }
 
 /// Libp2p behaviour for the Forest node. This handles all sub protocols needed for a Filecoin node.
@@ -548,7 +547,7 @@ impl ForestBehaviour {
         peer_id: &PeerId,
         cid: Cid,
         data: Box<[u8]>,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), anyhow::Error> {
         debug!("send {}", cid.to_string());
         let cid = cid.to_bytes();
         let cid = Cid2::try_from(cid)?;
@@ -557,7 +556,7 @@ impl ForestBehaviour {
     }
 
     /// Send a request for data over bitswap
-    pub fn want_block(&mut self, cid: Cid, priority: Priority) -> Result<(), Box<dyn Error>> {
+    pub fn want_block(&mut self, cid: Cid, priority: Priority) -> Result<(), anyhow::Error> {
         debug!("want {}", cid.to_string());
         let cid = cid.to_bytes();
         let cid = Cid2::try_from(cid)?;

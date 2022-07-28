@@ -1,38 +1,37 @@
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
-use jsonrpc_v2::{Data, Error as JsonRpcError, Id, Params};
-use log::debug;
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-
 use crate::rpc_util::get_error_obj;
+use ::forest_message::message::json::MessageJson;
+use async_std::{fs::File, io::BufWriter};
 use beacon::Beacon;
-use blocks::{
+use chain::headchange_json::HeadChangeJson;
+use cid::Cid;
+use forest_blocks::{
     header::json::BlockHeaderJson, tipset_json::TipsetJson, tipset_keys_json::TipsetKeysJson,
     BlockHeader, Tipset,
 };
-use blockstore::BlockStore;
-use chain::headchange_json::HeadChangeJson;
-use cid::{json::CidJson, Cid};
-use crypto::DomainSeparationTag;
-use message::{
-    unsigned_message::{self, json::UnsignedMessageJson},
-    UnsignedMessage,
-};
-use num_traits::FromPrimitive;
+use forest_json::cid::CidJson;
+use forest_message::message;
+use fvm_shared::message::Message as FVMMessage;
+use ipld_blockstore::{BlockStore, BlockStoreExt};
+use jsonrpc_v2::{Data, Error as JsonRpcError, Id, Params};
+use log::debug;
+use networks::Height;
 use rpc_api::{
     chain_api::*,
     data_types::{BlockMessages, RPCState},
 };
+use serde::{Deserialize, Serialize};
+use std::{path::PathBuf, sync::Arc};
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct Message {
-    #[serde(with = "cid::json")]
+    #[serde(with = "forest_json::cid")]
     cid: Cid,
-    #[serde(with = "unsigned_message::json")]
-    message: UnsignedMessage,
+    #[serde(with = "message::json")]
+    message: FVMMessage,
 }
 
 pub(crate) async fn chain_get_message<DB, B>(
@@ -44,12 +43,50 @@ where
     B: Beacon + Send + Sync + 'static,
 {
     let (CidJson(msg_cid),) = params;
-    let ret: UnsignedMessage = data
+    let ret: FVMMessage = data
         .state_manager
         .blockstore()
-        .get(&msg_cid)?
+        .get_obj(&msg_cid)?
         .ok_or("can't find message with that cid")?;
-    Ok(UnsignedMessageJson(ret))
+    Ok(MessageJson(ret))
+}
+
+pub(crate) async fn chain_export<DB, B>(
+    data: Data<RPCState<DB, B>>,
+    Params(params): Params<ChainExportParams>,
+) -> Result<ChainExportResult, JsonRpcError>
+where
+    DB: BlockStore + Send + Sync + 'static,
+    B: Beacon + Send + Sync + 'static,
+{
+    let (epoch, recent_roots, skip_old_msgs, out, TipsetKeysJson(tsk)) = params;
+
+    let chain_finality = data.state_manager.chain_config().policy.chain_finality;
+    let recent_roots = recent_roots.unwrap_or(chain_finality);
+    if recent_roots < chain_finality {
+        Err(&format!(
+            "recent-stateroots must be greater than {}",
+            chain_finality
+        ))?;
+    }
+
+    if recent_roots == 0 && skip_old_msgs {
+        Err("must pass recent-stateroots along with skip-old-messages")?;
+    }
+
+    let file = File::create(&out).await.map_err(JsonRpcError::from)?;
+    let writer = BufWriter::new(file);
+
+    let head = data.chain_store.tipset_from_keys(&tsk).await?;
+
+    let start_ts = data.chain_store.tipset_by_height(epoch, head, true).await?;
+
+    data.chain_store
+        .export(&start_ts, recent_roots, skip_old_msgs, writer)
+        .await
+        .map_err(JsonRpcError::from)?;
+
+    Ok(PathBuf::from(out))
 }
 
 pub(crate) async fn chain_read_obj<DB, B>(
@@ -97,7 +134,7 @@ where
     let blk: BlockHeader = data
         .state_manager
         .blockstore()
-        .get(&blk_cid)?
+        .get_obj(&blk_cid)?
         .ok_or("can't find block with that cid")?;
     let blk_msgs = blk.messages();
     let (unsigned_cids, signed_cids) =
@@ -237,7 +274,7 @@ where
     let blk: BlockHeader = data
         .state_manager
         .blockstore()
-        .get(&blk_cid)?
+        .get_obj(&blk_cid)?
         .ok_or("can't find BlockHeader with that cid")?;
     Ok(BlockHeaderJson(blk))
 }
@@ -269,14 +306,15 @@ where
 {
     let (TipsetKeysJson(tsk), pers, epoch, entropy) = params;
     let entropy = entropy.unwrap_or_default();
+    let hyperdrive_height = data.state_manager.chain_config().epoch(Height::Hyperdrive);
     Ok(data
         .state_manager
         .get_chain_randomness(
             &tsk,
-            DomainSeparationTag::from_i64(pers).ok_or("invalid DomainSeparationTag")?,
+            pers,
             epoch,
             &base64::decode(entropy)?,
-            epoch <= networks::UPGRADE_HYPERDRIVE_HEIGHT,
+            epoch <= hyperdrive_height,
         )
         .await?)
 }
@@ -294,11 +332,6 @@ where
 
     Ok(data
         .state_manager
-        .get_beacon_randomness(
-            &tsk,
-            DomainSeparationTag::from_i64(pers).ok_or("invalid DomainSeparationTag")?,
-            epoch,
-            &base64::decode(entropy)?,
-        )
+        .get_beacon_randomness(&tsk, pers, epoch, &base64::decode(entropy)?)
         .await?)
 }

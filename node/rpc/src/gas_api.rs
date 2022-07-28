@@ -5,15 +5,15 @@ use jsonrpc_v2::{Data, Error as JsonRpcError, Params};
 use num_traits::{FromPrimitive, Zero};
 use rand_distr::{Distribution, Normal};
 
-use address::json::AddressJson;
 use beacon::Beacon;
-use blocks::{tipset_keys_json::TipsetKeysJson, TipsetKeys};
-use blockstore::BlockStore;
 use chain::{BASE_FEE_MAX_CHANGE_DENOM, BLOCK_GAS_TARGET, MINIMUM_BASE_FEE};
-use fil_types::{verifier::ProofVerifier, BLOCK_GAS_LIMIT};
-use message::{unsigned_message::json::UnsignedMessageJson, UnsignedMessage};
-use message::{ChainMessage, Message};
-use num_bigint::BigInt;
+use fil_types::BLOCK_GAS_LIMIT;
+use forest_blocks::{tipset_keys_json::TipsetKeysJson, TipsetKeys};
+use forest_json::address::json::AddressJson;
+use forest_message::{message::json::MessageJson, ChainMessage};
+use fvm_shared::bigint::BigInt;
+use fvm_shared::message::Message;
+use ipld_blockstore::BlockStore;
 use rpc_api::{
     data_types::{MessageSendSpec, RPCState},
     gas_api::*,
@@ -30,7 +30,7 @@ where
     DB: BlockStore + Send + Sync + 'static,
     B: Beacon + Send + Sync + 'static,
 {
-    let (UnsignedMessageJson(msg), max_queue_blks, TipsetKeysJson(tsk)) = params;
+    let (MessageJson(msg), max_queue_blks, TipsetKeysJson(tsk)) = params;
 
     estimate_fee_cap::<DB, B>(&data, msg, max_queue_blks, tsk)
         .await
@@ -39,7 +39,7 @@ where
 
 async fn estimate_fee_cap<DB, B>(
     data: &Data<RPCState<DB, B>>,
-    msg: UnsignedMessage,
+    msg: Message,
     max_queue_blks: i64,
     _tsk: TipsetKeys,
 ) -> Result<BigInt, JsonRpcError>
@@ -62,7 +62,7 @@ where
         * BigInt::from_f64(increase_factor * (1 << 8) as f64)
             .ok_or("failed to convert fee_in_future f64 to bigint")?;
     let mut out = fee_in_future / (1 << 8);
-    out += msg.gas_premium();
+    out += msg.gas_premium;
     Ok(out)
 }
 
@@ -124,8 +124,8 @@ where
             &mut msgs
                 .iter()
                 .map(|msg| GasMeta {
-                    price: msg.gas_premium().clone(),
-                    limit: msg.gas_limit(),
+                    price: msg.message().gas_premium.clone(),
+                    limit: msg.message().gas_limit,
                 })
                 .collect(),
         );
@@ -175,33 +175,31 @@ where
 }
 
 /// Estimate the gas limit
-pub(crate) async fn gas_estimate_gas_limit<DB, B, V>(
+pub(crate) async fn gas_estimate_gas_limit<DB, B>(
     data: Data<RPCState<DB, B>>,
     Params(params): Params<GasEstimateGasLimitParams>,
 ) -> Result<GasEstimateGasLimitResult, JsonRpcError>
 where
     DB: BlockStore + Send + Sync + 'static,
     B: Beacon + Send + Sync + 'static,
-    V: ProofVerifier + Send + Sync + 'static,
 {
-    let (UnsignedMessageJson(msg), TipsetKeysJson(tsk)) = params;
-    estimate_gas_limit::<DB, B, V>(&data, msg, tsk).await
+    let (MessageJson(msg), TipsetKeysJson(tsk)) = params;
+    estimate_gas_limit::<DB, B>(&data, msg, tsk).await
 }
 
-async fn estimate_gas_limit<DB, B, V>(
+async fn estimate_gas_limit<DB, B>(
     data: &Data<RPCState<DB, B>>,
-    msg: UnsignedMessage,
+    msg: Message,
     _: TipsetKeys,
 ) -> Result<i64, JsonRpcError>
 where
     DB: BlockStore + Send + Sync + 'static,
     B: Beacon + Send + Sync + 'static,
-    V: ProofVerifier + Send + Sync + 'static,
 {
     let mut msg = msg;
-    msg.set_gas_limit(BLOCK_GAS_LIMIT);
-    msg.set_gas_fee_cap(MINIMUM_BASE_FEE.clone() + 1);
-    msg.set_gas_premium(1.into());
+    msg.gas_limit = BLOCK_GAS_LIMIT;
+    msg.gas_fee_cap = MINIMUM_BASE_FEE.clone() + 1;
+    msg.gas_premium = 1.into();
 
     let curr_ts = data
         .state_manager
@@ -211,7 +209,7 @@ where
         .ok_or("cant find the current heaviest tipset")?;
     let from_a = data
         .state_manager
-        .resolve_to_key_addr::<V>(msg.from(), &curr_ts)
+        .resolve_to_key_addr(&msg.from, &curr_ts)
         .await?;
 
     let pending = data.mpool.pending_for(&from_a).await;
@@ -221,7 +219,7 @@ where
 
     let res = data
         .state_manager
-        .call_with_gas::<V>(
+        .call_with_gas(
             &mut ChainMessage::Unsigned(msg),
             &prior_messages,
             Some(data.mpool.cur_tipset.as_ref().read().await.clone()),
@@ -229,7 +227,7 @@ where
         .await?;
     match res.msg_rct {
         Some(rct) => {
-            if rct.exit_code as u64 != 0 {
+            if rct.exit_code.value() != 0 {
                 return Ok(-1);
             }
             // TODO: Figure out why we always under estimate the gas calculation so we dont need to add 200000
@@ -241,42 +239,40 @@ where
 }
 
 /// Estimates the gas paramaters for a given message
-pub(crate) async fn gas_estimate_message_gas<DB, B, V>(
+pub(crate) async fn gas_estimate_message_gas<DB, B>(
     data: Data<RPCState<DB, B>>,
     Params(params): Params<GasEstimateMessageGasParams>,
 ) -> Result<GasEstimateMessageGasResult, JsonRpcError>
 where
     DB: BlockStore + Send + Sync + 'static,
     B: Beacon + Send + Sync + 'static,
-    V: ProofVerifier + Send + Sync + 'static,
 {
-    let (UnsignedMessageJson(msg), spec, TipsetKeysJson(tsk)) = params;
-    estimate_message_gas::<DB, B, V>(&data, msg, spec, tsk)
+    let (MessageJson(msg), spec, TipsetKeysJson(tsk)) = params;
+    estimate_message_gas::<DB, B>(&data, msg, spec, tsk)
         .await
-        .map(UnsignedMessageJson::from)
+        .map(MessageJson::from)
 }
 
-pub(crate) async fn estimate_message_gas<DB, B, V>(
+pub(crate) async fn estimate_message_gas<DB, B>(
     data: &Data<RPCState<DB, B>>,
-    msg: UnsignedMessage,
+    msg: Message,
     _spec: Option<MessageSendSpec>,
     tsk: TipsetKeys,
-) -> Result<UnsignedMessage, JsonRpcError>
+) -> Result<Message, JsonRpcError>
 where
     DB: BlockStore + Send + Sync + 'static,
     B: Beacon + Send + Sync + 'static,
-    V: ProofVerifier + Send + Sync + 'static,
 {
     let mut msg = msg;
-    if msg.gas_limit() == 0 {
-        let gl = estimate_gas_limit::<DB, B, V>(data, msg.clone(), tsk.clone()).await?;
+    if msg.gas_limit == 0 {
+        let gl = estimate_gas_limit::<DB, B>(data, msg.clone(), tsk.clone()).await?;
         msg.gas_limit = gl;
     }
-    if msg.gas_premium().is_zero() {
+    if msg.gas_premium.is_zero() {
         let gp = estimate_gas_premium(data, 10).await?;
         msg.gas_premium = gp;
     }
-    if msg.gas_fee_cap().is_zero() {
+    if msg.gas_fee_cap.is_zero() {
         let gfp = estimate_fee_cap(data, msg.clone(), 20, tsk).await?;
         msg.gas_fee_cap = gfp;
     }

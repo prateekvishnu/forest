@@ -1,13 +1,13 @@
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
-use encoding::error::Error as CborError;
+use forest_encoding::error::Error as CborError;
 use serde::ser;
 use std::fmt;
 use thiserror::Error;
 
 /// Ipld error
-#[derive(Debug, PartialEq, Error)]
+#[derive(Debug, PartialEq, Eq, Error)]
 pub enum Error {
     #[error("{0}")]
     Encoding(String),

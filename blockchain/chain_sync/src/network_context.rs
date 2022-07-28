@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0, MIT
 
 use super::peer_manager::PeerManager;
-use blocks::{FullTipset, Tipset, TipsetKeys};
 use cid::Cid;
-use encoding::de::DeserializeOwned;
+use forest_blocks::{FullTipset, Tipset, TipsetKeys};
+use forest_encoding::de::DeserializeOwned;
 use forest_libp2p::{
     chain_exchange::{
         ChainExchangeRequest, ChainExchangeResponse, CompactedMessages, TipsetBundle, HEADERS,
@@ -15,7 +15,7 @@ use forest_libp2p::{
     NetworkMessage,
 };
 use futures::channel::oneshot::channel as oneshot_channel;
-use ipld_blockstore::BlockStore;
+use ipld_blockstore::{BlockStore, BlockStoreExt};
 use libp2p::core::PeerId;
 use log::{debug, trace, warn};
 use std::convert::TryFrom;
@@ -31,10 +31,10 @@ use async_std::future;
 const RPC_TIMEOUT: u64 = 5;
 
 /// Context used in chain sync to handle network requests.
-/// This contains the peer manager, p2p service interface, and [BlockStore] required to make
+/// This contains the peer manager, P2P service interface, and [`BlockStore`] required to make
 /// network requests.
 pub(crate) struct SyncNetworkContext<DB> {
-    /// Channel to send network messages through p2p service
+    /// Channel to send network messages through P2P service
     network_send: Sender<NetworkMessage>,
 
     /// Manages peers to send requests to and updates request stats for the respective peers.
@@ -73,7 +73,7 @@ where
         self.peer_manager.as_ref()
     }
 
-    /// Send a chain_exchange request for only block headers (ignore messages).
+    /// Send a `chain_exchange` request for only block headers (ignore messages).
     /// If `peer_id` is `None`, requests will be sent to a set of shuffled peers.
     pub async fn chain_exchange_headers(
         &self,
@@ -84,7 +84,7 @@ where
         self.handle_chain_exchange_request(peer_id, tsk, count, HEADERS)
             .await
     }
-    /// Send a chain_exchange request for only messages (ignore block headers).
+    /// Send a `chain_exchange` request for only messages (ignore block headers).
     /// If `peer_id` is `None`, requests will be sent to a set of shuffled peers.
     pub async fn chain_exchange_messages(
         &self,
@@ -96,7 +96,7 @@ where
             .await
     }
 
-    /// Send a chain_exchange request for a single full tipset (includes messages)
+    /// Send a `chain_exchange` request for a single full tipset (includes messages)
     /// If `peer_id` is `None`, requests will be sent to a set of shuffled peers.
     pub async fn chain_exchange_fts(
         &self,
@@ -116,15 +116,15 @@ where
         Ok(fts.remove(0))
     }
 
-    /// Requests that some content with a particular Cid get fetched over Bitswap if it doesn't
-    /// exist in the BlockStore.
+    /// Requests that some content with a particular `Cid` get fetched over `Bitswap` if it doesn't
+    /// exist in the `BlockStore`.
     pub async fn bitswap_get<TMessage: DeserializeOwned>(
         &self,
         content: Cid,
     ) -> Result<TMessage, String> {
         // Check if what we are fetching over Bitswap already exists in the
         // database. If it does, return it, else fetch over the network.
-        if let Some(b) = self.db.get(&content).map_err(|e| e.to_string())? {
+        if let Some(b) = self.db.get_obj(&content).map_err(|e| e.to_string())? {
             return Ok(b);
         }
         let (tx, rx) = oneshot_channel();
@@ -138,7 +138,7 @@ where
         let res = future::timeout(Duration::from_secs(RPC_TIMEOUT), rx).await;
         match res {
             Ok(Ok(())) => {
-                match self.db.get(&content) {
+                match self.db.get_obj(&content) {
                     Ok(Some(b)) => Ok(b),
                     Ok(None) => Err(format!("Bitswap response successful for: {:?}, but can't find it in the database", content)),
                     Err(e) => Err(format!("Bitswap response successful for: {:?}, but can't retreive it from the database: {}", content, e)),
@@ -217,7 +217,7 @@ where
         Ok(bs_res)
     }
 
-    /// Send a chain_exchange request to the network and await response.
+    /// Send a `chain_exchange` request to the network and await response.
     async fn chain_exchange_request(
         &self,
         peer_id: PeerId,

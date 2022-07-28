@@ -2,18 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0, MIT
 
 use super::gas_api::estimate_message_gas;
-use address::{Address, Protocol};
 use beacon::Beacon;
-use blocks::TipsetKeys;
-use blockstore::BlockStore;
-use cid::json::{vec::CidJsonVec, CidJson};
-use encoding::Cbor;
-use fil_types::verifier::{FullVerifier, ProofVerifier};
-use message::Message;
-use message::{
-    signed_message::json::SignedMessageJson, unsigned_message::json::UnsignedMessageJson,
-    SignedMessage,
-};
+use forest_blocks::TipsetKeys;
+use forest_json::cid::{vec::CidJsonVec, CidJson};
+use forest_message::message::json::MessageJson;
+use forest_message::{signed_message::json::SignedMessageJson, SignedMessage};
+use fvm_ipld_encoding::Cbor;
+use fvm_shared::address::{Address, Protocol};
+use ipld_blockstore::BlockStore;
 use rpc_api::data_types::RPCState;
 use rpc_api::mpool_api::*;
 
@@ -135,18 +131,17 @@ where
 }
 
 /// Sign given UnsignedMessage and add it to mpool, return SignedMessage
-pub(crate) async fn mpool_push_message<DB, B, V>(
+pub(crate) async fn mpool_push_message<DB, B>(
     data: Data<RPCState<DB, B>>,
     Params(params): Params<MpoolPushMessageParams>,
 ) -> Result<MpoolPushMessageResult, JsonRpcError>
 where
     DB: BlockStore + Send + Sync + 'static,
     B: Beacon + Send + Sync + 'static,
-    V: ProofVerifier + Send + Sync + 'static,
 {
-    let (UnsignedMessageJson(umsg), spec) = params;
+    let (MessageJson(umsg), spec) = params;
 
-    let from = *umsg.from();
+    let from = umsg.from;
 
     let mut keystore = data.keystore.as_ref().write().await;
     let heaviest_tipset = data
@@ -157,16 +152,16 @@ where
         .ok_or_else(|| "Could not get heaviest tipset".to_string())?;
     let key_addr = data
         .state_manager
-        .resolve_to_key_addr::<FullVerifier>(&from, &heaviest_tipset)
+        .resolve_to_key_addr(&from, &heaviest_tipset)
         .await?;
 
-    if umsg.sequence() != 0 {
+    if umsg.sequence != 0 {
         return Err(
             "Expected nonce for MpoolPushMessage is 0, and will be calculated for you.".into(),
         );
     }
-    let mut umsg = estimate_message_gas::<DB, B, V>(&data, umsg, spec, Default::default()).await?;
-    if umsg.gas_premium() > umsg.gas_fee_cap() {
+    let mut umsg = estimate_message_gas::<DB, B>(&data, umsg, spec, Default::default()).await?;
+    if umsg.gas_premium > umsg.gas_fee_cap {
         return Err("After estimation, gas premium is greater than gas fee cap".into());
     }
 
@@ -175,8 +170,8 @@ where
     }
     let nonce = data.mpool.get_sequence(&from).await?;
     umsg.sequence = nonce;
-    let key = wallet::Key::try_from(wallet::try_find(&key_addr, &mut *keystore)?)?;
-    let sig = wallet::sign(
+    let key = key_management::Key::try_from(key_management::try_find(&key_addr, &mut *keystore)?)?;
+    let sig = key_management::sign(
         *key.key_info.key_type(),
         key.key_info.private_key(),
         umsg.to_signing_bytes().as_slice(),
